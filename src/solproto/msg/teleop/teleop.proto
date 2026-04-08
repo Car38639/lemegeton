@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package solproto.teleop;
+
+import "google/protobuf/timestamp.proto";
+import "solproto/msg/common/manipulator.proto";
+import "solproto/msg/common/geometry.proto";
+
+
+
+message TeleopHeader {
+    google.protobuf.Timestamp timestamp = 1;
+    uint32 frame_id = 2;
+    string device_type = 3;
+    repeated string activated_joints = 4;
+    bool enable_dexterous = 5;
+}
+
+message TeleopData {
+    // 1. Header
+    TeleopHeader header = 1;
+    
+    // --- Base ---
+    solproto.common.geometry.Pose pelvis = 2;        
+    solproto.common.geometry.Pose waist = 3;
+    solproto.common.geometry.Pose torso = 4;
+
+    // --- Head ---
+    solproto.common.geometry.Pose neck = 5;
+    solproto.common.geometry.Pose head = 6;
+
+    // --- Left Upper Body ---
+    solproto.common.geometry.Pose left_shoulder = 7;
+    solproto.common.geometry.Pose left_elbow = 8;
+    solproto.common.geometry.Pose left_wrist = 9;
+    solproto.common.geometry.Pose left_hand = 10;    // 手掌根部 (Hand Root)
+
+    // --- Right Upper Body ---
+    solproto.common.geometry.Pose right_shoulder = 11;
+    solproto.common.geometry.Pose right_elbow = 12;
+    solproto.common.geometry.Pose right_wrist = 13;
+    solproto.common.geometry.Pose right_hand = 14;   // 手掌根部 (Hand Root)
+
+    // --- Left Lower Body ---
+    solproto.common.geometry.Pose left_hip = 15;
+    solproto.common.geometry.Pose left_knee = 16;
+    solproto.common.geometry.Pose left_ankle = 17;
+    solproto.common.geometry.Pose left_foot = 18;
+    solproto.common.geometry.Pose left_toe = 19;
+
+    // --- Right Lower Body ---
+    solproto.common.geometry.Pose right_hip = 20;
+    solproto.common.geometry.Pose right_knee = 21;
+    solproto.common.geometry.Pose right_ankle = 22;
+    solproto.common.geometry.Pose right_foot = 23;
+    solproto.common.geometry.Pose right_toe = 24;
+
+    // --- Dexterous Hands ---
+    repeated solproto.common.geometry.Pose left_dexterous = 25; 
+    repeated solproto.common.geometry.Pose right_dexterous = 26;
+}

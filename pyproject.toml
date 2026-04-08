@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "solproto"
+version = "0.1.0"
+description = "this project manage protobuf message for solhumanoid"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "Awen Hunag", email = "awen_huang@solomon-3d.com" }
+]
+# 專案運行所需的第三方套件
+dependencies = []
+
+
+[tool.setuptools]
+# 告訴 Python 原始碼在哪裡
+package-dir = { "" = "src"}
+
+[tool.setuptools.packages.find]
+# 自動在 src 目錄下尋找套件
+where = ["src"]
+
+# --- 其他常見工具設定 (讓你的專案更專業) ---
+
+[tool.black]
+line-length = 88
+target-version = ['py311']
+
+[tool.isort]
+profile = "black"
+known_first_party = ["solproto"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package solproto.humanoid.state;
+
+import "google/protobuf/timestamp.proto";
+import "solproto/msg/common/manipulator.proto";
+
+message StateMessage {
+string type = 1; // inspire_hand, ...
+  repeated string field = 2;
+  int32 dof = 3;
+  solproto.common.manipulator.JointState jointstate = 4;
+}
+
+message State {
+  google.protobuf.Timestamp timestamp = 1;
+
+  StateMessage limb = 2;
+  StateMessage left_hand = 3;
+  StateMessage right_hand = 4;
+}

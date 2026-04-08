@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package solproto.common.manipulator;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+message JointHeader {
+  int32 dof = 1;
+  repeated string field = 2;
+  google.protobuf.Timestamp timestamp = 3;
+}
+
+message JointState {
+  repeated double positions = 1;
+  repeated double velocities = 2;
+  repeated double accelerations = 3;
+  repeated double efforts = 4;
+}
+
+message TrajectoryPoint {
+  repeated double positions = 1;
+  repeated double velocities = 2;
+  repeated double accelerations = 3;
+  repeated double efforts = 4;
+  google.protobuf.Duration time_from_start = 5;
+}
+
+message JointTrajectory{
+  JointHeader header = 1;
+  repeated TrajectoryPoint points = 2;
+}
