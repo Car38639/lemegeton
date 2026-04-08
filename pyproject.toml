@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "setuptools_scm[toml]>=6.2"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "solproto"
+name = "lemegeton"
 version = "0.1.0"
-description = "this project manage protobuf message for solhumanoid"
+description = ""
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [
@@ -16,14 +16,12 @@ dependencies = []
 
 
 [tool.setuptools]
-# 告訴 Python 原始碼在哪裡
 package-dir = { "" = "src"}
 
 [tool.setuptools.packages.find]
-# 自動在 src 目錄下尋找套件
 where = ["src"]
 
-# --- 其他常見工具設定 (讓你的專案更專業) ---
+# --- 其他常見工具設定 ---
 
 [tool.black]
 line-length = 88
@@ -31,7 +29,7 @@ target-version = ['py311']
 
 [tool.isort]
 profile = "black"
-known_first_party = ["solproto"]
+known_first_party = ["lemegeton"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

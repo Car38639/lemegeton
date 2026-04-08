@@ -1,7 +1,7 @@
 syntax = "proto3";
 import "google/protobuf/timestamp.proto";
 
-package solproto.sensor.image;
+package lemegeton.sensor.image;
 
 message Image {
   bytes data = 1;

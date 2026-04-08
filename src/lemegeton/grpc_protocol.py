@@ -5,9 +5,9 @@ import grpc
 """
 Example gRPC Server Usage:
 
-import solproto.protocol.protobuf.template.template_pb2 as template_pb2
-import solproto.protocol.protobuf.template.template_pb2_grpc as template_pb2_grpc
-from solproto.protocol.protobuf.grpc_protocol import GRPCServer
+import lemegeton.protocol.protobuf.template.template_pb2 as template_pb2
+import lemegeton.protocol.protobuf.template.template_pb2_grpc as template_pb2_grpc
+from lemegeton.protocol.protobuf.grpc_protocol import GRPCServer
 
 if __name__ == "__main__":
 
@@ -62,9 +62,9 @@ class GRPCServer:
 """
 Example gRPC Client Usage:
 
-import solproto.protocol.protobuf.template.template_pb2 as template_pb2
-import solproto.protocol.protobuf.template.template_pb2_grpc as template_pb2_grpc
-from solproto.protocol.protobuf.grpc_protocol import GRPCClient
+import lemegeton.protocol.protobuf.template.template_pb2 as template_pb2
+import lemegeton.protocol.protobuf.template.template_pb2_grpc as template_pb2_grpc
+from lemegeton.protocol.protobuf.grpc_protocol import GRPCClient
 
 
 def run():

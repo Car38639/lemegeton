@@ -1,6 +1,7 @@
 import zmq
-from solproto.msg.common.std_msgs_pb2 import Int, String
-from solproto.zmq_protocol import (
+from lemegeton.msg.common.std_msgs_pb2 import Int, String
+
+from lemegeton.zmq_protocol import (
     ZmqProtobufRouter,
 )
 

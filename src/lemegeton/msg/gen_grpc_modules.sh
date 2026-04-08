@@ -6,7 +6,7 @@ usage() {
   echo "Usage: $0 -p <proto_file>"
   echo
   echo "Options:"
-  echo "  -p    proto path"
+  echo "  -p    proto file"
   echo "  -h    Show this help message"
   echo
   echo "Example:"
@@ -20,7 +20,7 @@ fi
 
 while getopts "p:h" opt; do
   case $opt in
-    p) PROTO_PATH=$OPTARG ;;
+    p) PROTO_FILE=$OPTARG ;;
     h)
       usage
       exit 0
@@ -32,7 +32,7 @@ while getopts "p:h" opt; do
   esac
 done
 
-if [ -z "$PROTO_PATH" ]; then
+if [ -z "$PROTO_FILE" ]; then
   echo "❌ Error: -p is required"
   echo
   usage
@@ -40,19 +40,18 @@ if [ -z "$PROTO_PATH" ]; then
 fi
 
 
-if [ ! -f "$PROTO_PATH" ]; then
-  echo "❌ Error: cannot find $PROTO_PATH"
+if [ ! -f "$PROTO_FILE" ]; then
+  echo "❌ Error: proto file not found: $PROTO_FILE"
   exit 1
 fi
 
-# # ===== 新增資料夾邏輯 =====
-# INIT_FILE="$PROTO_PATH/__init__.py"
-# if [ ! -f "$INIT_FILE" ]; then
-#   touch "$INIT_FILE"
-# fi
-
 
 cd "$WORKSPACE/libs/protocol/src"
-protoc -I=. --python_out=. "solproto/msg/$PROTO_PATH"
 
-echo "✅ Generated $PROTO_PATH python message."
+python -m grpc_tools.protoc \
+  -I. \
+  --python_out=. \
+  --grpc_python_out=. \
+  "lemegeton/msg/$PROTO_FILE"
+
+echo "✅ Generated $PROTO_FILE protobuf grpc python files."

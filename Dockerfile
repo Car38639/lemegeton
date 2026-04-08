@@ -9,13 +9,6 @@ RUN apt update && apt install -y  \
     curl \ 
     cmake \
     vim \ 
-    # git \ 
-    # build-essential \
-    # libxcb-cursor0 \ 
-    # libxcb1 \
-    # libglib2.0-0 \
-    # libusb-1.0-0 \
-    # libgl1 \
     protobuf-compiler
 
 RUN pip3 install protobuf

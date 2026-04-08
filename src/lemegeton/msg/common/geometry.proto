@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package solproto.common.geometry;
+package lemegeton.common.geometry;
 
 message Vector2{
   double x = 1;

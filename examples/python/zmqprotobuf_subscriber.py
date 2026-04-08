@@ -1,6 +1,7 @@
 import zmq
-from solproto.msg.common.std_msgs_pb2 import String
-from solproto.zmq_protocol import ZmqProtobufSubscriber
+from lemegeton.msg.common.std_msgs_pb2 import String
+
+from lemegeton.zmq_protocol import ZmqProtobufSubscriber
 
 if __name__ == "__main__":
     # If you run multiple ZmqProtobuf protocols in the same Process,

@@ -1,8 +1,9 @@
 import time
 
 import zmq
-from solproto.msg.common.std_msgs_pb2 import Bool, String
-from solproto.zmq_protocol import ZmqProtobufPublisher
+from lemegeton.msg.common.std_msgs_pb2 import Bool, String
+
+from lemegeton.zmq_protocol import ZmqProtobufPublisher
 
 if __name__ == "__main__":
     # If you run multiple ZmqProtobuf protocols in the same Process,
