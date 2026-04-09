@@ -1,0 +1,36 @@
+services:
+  server:
+    container_name: lemegeton
+    build:
+      context: .
+      dockerfile: Dockerfile
+    tty: true
+    privileged: true
+    # restart: always
+    runtime: nvidia
+    network_mode: host
+    working_dir: /root/workspace
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - DISPLAY=$DISPLAY
+      - XAUTHORITY=/tmp/.docker.xauth
+      - QT_X11_NO_MITSHM=1
+      - RCUTILS_COLORIZED_OUTPUT=1
+    volumes:
+      - /dev:/dev
+      - /dev/bus/usb:/dev/bus/usb
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /tmp/.docker.xauth:/tmp/.docker.xauth
+      # mount source for development
+      - .:/root/workspace/
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: 3
+    command: >
+      bash -c "
+        cd workspace
+        bash"

@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package lemegeton.humanoid.robot_control;
+
+import "google/protobuf/timestamp.proto";
+import "lemegeton/msg/common/manipulator.proto";
+import "lemegeton/msg/common/geometry.proto";
+
+enum DataMode {
+  jointstate = 0;
+  pose = 1;
+}
+
+// ===== Modular Control =====
+
+message Arm {
+  bool enable= 1;
+  DataMode data_mode = 2;
+  repeated string field = 3;
+  int32 dof = 4;
+  oneof arm {
+    lemegeton.common.manipulator.JointState jointstate = 5;
+    lemegeton.common.geometry.Pose pose = 6;
+  }
+}
+
+message Waist {
+  bool enable= 1;
+  DataMode data_mode = 2;
+  repeated string field = 3;
+  int32 dof = 4;
+  oneof waist {
+    lemegeton.common.manipulator.JointState jointstate = 5;
+    lemegeton.common.geometry.Quaternion orientation = 6;
+  }
+}
+
+message Locomotion {
+  bool enable= 1;
+  lemegeton.common.geometry.Twist twist = 2;
+  float waist_height = 3; // squat / stand
+}
+
+message ModularControl {
+  Arm arm = 1;
+  Waist waist = 2;
+  Locomotion locomotion = 3;
+}
+
+// ===== Whole Body Control =====
+
+message WholeBodyControl {
+  int32 dof = 1;
+  lemegeton.common.manipulator.JointState jointstate = 2;
+}
+
+// ===== Hand Control =====
+
+message HandControl {
+  bool enable= 1;
+  string type = 2; // inspire_hand, ...
+  repeated string field = 3;
+  int32 dof = 4;
+  lemegeton.common.manipulator.JointState jointstate = 5;
+}
+
+message HandGrasp {
+  bool enable =1;
+  float value=2;
+}
+
+// ===== Root: Robot Control =====
+
+message RobotControl {
+  enum ControlMode {
+    MC = 0;
+    WBC = 1;
+  }
+  google.protobuf.Timestamp timestamp = 1;
+
+  string robot_type = 2;
+  ControlMode control_mode = 3;
+  oneof limb {
+    ModularControl mc = 4;
+    WholeBodyControl wbc = 5;
+  }
+
+  oneof left_hand_control{
+    HandControl left_hand = 6;
+    HandGrasp left_grasp = 7;
+  }
+
+  oneof left_hand_control{
+    HandControl right_hand = 8;
+    HandGrasp right_grasp = 9;
+  }
+
+}

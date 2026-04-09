@@ -1,0 +1,110 @@
+<?xml version="1.0"?>
+<robot name="humanoid">
+
+  <link name="pelvis">
+    <visual>
+      <geometry><box size="0.2 0.3 0.15"/></geometry>
+      <material name="blue"><color rgba="0 0 0.8 1"/></material>
+    </visual>
+  </link>
+
+  <link name="waist">
+    <visual>
+      <geometry><cylinder radius="0.12" length="0.15"/></geometry>
+      <material name="grey"><color rgba="0.5 0.5 0.5 1"/></material>
+    </visual>
+  </link>
+
+  <joint name="pelvis_to_waist" type="fixed">
+    <parent link="pelvis"/>
+    <child link="waist"/>
+    <origin xyz="0 0 0.15" rpy="0 0 0"/>
+  </joint>
+
+  <link name="torso">
+    <visual>
+      <geometry><box size="0.2 0.35 0.3"/></geometry>
+      <material name="blue"/>
+    </visual>
+  </link>
+
+  <joint name="waist_to_torso" type="fixed">
+    <parent link="waist"/>
+    <child link="torso"/>
+    <origin xyz="0 0 0.2" rpy="0 0 0"/>
+  </joint>
+
+  <link name="neck">
+    <visual>
+      <geometry><cylinder radius="0.05" length="0.1"/></geometry>
+    </visual>
+  </link>
+
+  <joint name="torso_to_neck" type="fixed">
+    <parent link="torso"/>
+    <child link="neck"/>
+    <origin xyz="0 0 0.2" rpy="0 0 0"/>
+  </joint>
+
+  <link name="head">
+    <visual>
+      <geometry><sphere radius="0.1"/></geometry>
+      <material name="white"><color rgba="1 1 1 1"/></material>
+    </visual>
+  </link>
+
+  <joint name="neck_to_head" type="fixed">
+    <parent link="neck"/>
+    <child link="head"/>
+    <origin xyz="0 0 0.1" rpy="0 0 0"/>
+  </joint>
+
+  <joint name="torso_to_l_shoulder" type="fixed">
+    <parent link="torso"/>
+    <child link="left_shoulder"/>
+    <origin xyz="0 0.2 0.15" rpy="0 0 0"/>
+  </joint>
+
+  <link name="left_shoulder"><visual><geometry><sphere radius="0.06"/></geometry></visual></link>
+
+  <joint name="l_shoulder_to_elbow" type="fixed">
+    <parent link="left_shoulder"/>
+    <child link="left_elbow"/>
+    <origin xyz="0 0 -0.3" rpy="0 0 0"/>
+  </joint>
+
+  <link name="left_elbow"><visual><geometry><cylinder radius="0.04" length="0.25"/></geometry></visual></link>
+
+  <joint name="l_elbow_to_wrist" type="fixed">
+    <parent link="left_elbow"/>
+    <child link="left_wrist"/>
+    <origin xyz="0 0 -0.25" rpy="0 0 0"/>
+  </joint>
+
+  <link name="left_wrist"><visual><geometry><box size="0.03 0.03 0.03"/></geometry></visual></link>
+
+  <joint name="pelvis_to_l_hip" type="fixed">
+    <parent link="pelvis"/>
+    <child link="left_hip"/>
+    <origin xyz="0 0.1 -0.05" rpy="0 0 0"/>
+  </joint>
+
+  <link name="left_hip"><visual><geometry><sphere radius="0.08"/></geometry></visual></link>
+
+  <joint name="l_hip_to_knee" type="fixed">
+    <parent link="left_hip"/>
+    <child link="left_knee"/>
+    <origin xyz="0 0 -0.45" rpy="0 0 0"/>
+  </joint>
+
+  <link name="left_knee"><visual><geometry><cylinder radius="0.06" length="0.4"/></geometry></visual></link>
+
+  <joint name="l_knee_to_ankle" type="fixed">
+    <parent link="left_knee"/>
+    <child link="left_ankle"/>
+    <origin xyz="0 0 -0.43" rpy="0 0 0"/>
+  </joint>
+
+  <link name="left_ankle"><visual><geometry><box size="0.15 0.08 0.05"/></geometry></visual></link>
+
+  </robot>

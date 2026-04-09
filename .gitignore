@@ -1,0 +1,17 @@
+.vscode
+.DS_Store
+
+build
+devel
+install
+log
+logs
+*.log
+
+*.pyc
+*__pycache__*
+*.egg-info
+
+
+*.pem
+

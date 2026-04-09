@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package lemegeton.common.geometry;
+
+message Vector2{
+  double x = 1;
+  double y = 2;
+}
+
+message Polygon2{
+  repeated Vector3 points = 1;
+}
+
+message Vector3 {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+}
+
+message Polygon3{
+  repeated Vector3 points = 1;
+}
+
+message Quaternion {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+  double w = 4;
+}
+
+message Pose {
+  Vector3 position = 1;
+  Quaternion orientation = 2;
+}
+
+message Transform {
+  Vector3 translation = 1;
+  Quaternion rotation = 2;
+}
+
+message Twist {
+  Vector3 linear = 1;
+  Vector3 angular = 2;
+}
+
+message Accel {
+  Vector3 linear = 1;
+  Vector3 angular = 2;
+}
+
+message Wrench {
+  Vector3 force = 1;
+  Vector3 torque = 2;
+}
+
+message Inertia {
+  double ixx = 1;
+  double ixy = 2;
+  double ixz = 3;
+  double iyy = 4;
+  double iyz = 5;
+  double izz = 6;
+}

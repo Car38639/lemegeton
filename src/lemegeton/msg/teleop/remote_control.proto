@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package lemegeton.teleop.remote_control;
+
+import "google/protobuf/timestamp.proto";
+
+message RemoteControlHeader {
+    google.protobuf.Timestamp timestamp = 1;
+    uint32 frame_id = 2;
+    string device_type = 3; // "JoyStick", "Hand Controller", "pedal"
+}
+
+message RemoteControl {
+    RemoteControlHeader header = 1;
+    float linear_x = 2;
+    float linear_y = 3;
+    float angular_z = 4;
+    float squat_up = 5;
+    float squat_down = 6;
+
+    float left_grasp = 7;
+    float right_grasp = 8;
+    
+    bool mode_1 = 9;
+    bool mode_2 = 10;
+    bool mode_3 = 11;
+    bool mode_4 = 12;
+
+    bool dpad_left = 13;
+    bool dpad_right = 14;
+    bool dpad_up = 15;
+    bool dpad_down = 16;
+
+    bool toggle_record = 17;
+    bool toggle_control = 18;
+    bool enable = 19;
+    bool estop = 20;
+}
