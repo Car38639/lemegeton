@@ -1,27 +1,22 @@
-import zmq
+import lemegeton
 from lemegeton.msg.common.std_msgs_pb2 import Bool, String
-
-from lemegeton.zmq_protocol import (
-    ZmqProtobufResponder,
-)
 
 if __name__ == "__main__":
     # If you run multiple ZmqProtobuf protocols in the same Process,
     # you should use the same zmq.Context()
     # otherwise it might cause trouble.
-    context = zmq.Context()
 
     def respond_callback(message):
         print(f"Receive message: {message.value}")
         response = String(value=f"Finish handling message: {message.value}")
         return response
 
-    responder = ZmqProtobufResponder(
-        request_class=Bool,
+    gateway = lemegeton.Gateway()
+    gateway.register_responder(
+        name="test_responder",
+        message_class=Bool,
         response_class=String,
         callback=respond_callback,
-        context=context,
-        port=60001,
     )
 
     import time
@@ -32,4 +27,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     finally:
-        responder.close()
+        gateway.remove("test_responder")
+        gateway.close()
