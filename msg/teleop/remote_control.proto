@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package lemegeton.teleop.remote_control;
+package teleop.remote_control;
 
 import "google/protobuf/timestamp.proto";
 

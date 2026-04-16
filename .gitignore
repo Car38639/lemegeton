@@ -12,6 +12,3 @@ logs
 *__pycache__*
 *.egg-info
 
-
-*.pem
-

@@ -14,12 +14,19 @@ authors = [
 # 專案運行所需的第三方套件
 dependencies = []
 
+[project.scripts]
+compile_protos = "lemegeton.compile_protos:run_bash"
 
 [tool.setuptools]
 package-dir = { "" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["lemegeton*"]
+
+[tool.setuptools.package-data]
+"lemegeton" = ["*.sh"]
+"lemegeton.msg" = ["*.*", "**/*.*"]
 
 # --- 其他常見工具設定 ---
 

@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package lemegeton.humanoid.robot_control;
+package humanoid.robot_control;
 
 import "google/protobuf/timestamp.proto";
 import "lemegeton/msg/common/manipulator.proto";
@@ -19,8 +19,8 @@ message Arm {
   repeated string field = 3;
   int32 dof = 4;
   oneof arm {
-    lemegeton.common.manipulator.JointState jointstate = 5;
-    lemegeton.common.geometry.Pose pose = 6;
+    lemegeton.msg.common.manipulator.JointState jointstate = 5;
+    lemegeton.msg.common.geometry.Pose pose = 6;
   }
 }
 
@@ -30,14 +30,14 @@ message Waist {
   repeated string field = 3;
   int32 dof = 4;
   oneof waist {
-    lemegeton.common.manipulator.JointState jointstate = 5;
-    lemegeton.common.geometry.Quaternion orientation = 6;
+    lemegeton.msg.common.manipulator.JointState jointstate = 5;
+    lemegeton.msg.common.geometry.Quaternion orientation = 6;
   }
 }
 
 message Locomotion {
   bool enable= 1;
-  lemegeton.common.geometry.Twist twist = 2;
+  lemegeton.msg.common.geometry.Twist twist = 2;
   float waist_height = 3; // squat / stand
 }
 
@@ -51,7 +51,7 @@ message ModularControl {
 
 message WholeBodyControl {
   int32 dof = 1;
-  lemegeton.common.manipulator.JointState jointstate = 2;
+  lemegeton.msg.common.manipulator.JointState jointstate = 2;
 }
 
 // ===== Hand Control =====
@@ -61,7 +61,7 @@ message HandControl {
   string type = 2; // inspire_hand, ...
   repeated string field = 3;
   int32 dof = 4;
-  lemegeton.common.manipulator.JointState jointstate = 5;
+  lemegeton.msg.common.manipulator.JointState jointstate = 5;
 }
 
 message HandGrasp {
@@ -90,7 +90,7 @@ message RobotControl {
     HandGrasp left_grasp = 7;
   }
 
-  oneof left_hand_control{
+  oneof right_hand_control{
     HandControl right_hand = 8;
     HandGrasp right_grasp = 9;
   }

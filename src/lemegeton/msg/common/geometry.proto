@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package lemegeton.common.geometry;
+package lemegeton.msg.common.geometry;
 
 message Vector2{
   double x = 1;

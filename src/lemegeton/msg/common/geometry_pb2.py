@@ -13,33 +13,33 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n#lemegeton/msg/common/geometry.proto\x12\x19lemegeton.common.geometry\"\x1f\n\x07Vector2\x12\t\n\x01x\x18\x01 \x01(\x01\x12\t\n\x01y\x18\x02 \x01(\x01\">\n\x08Polygon2\x12\x32\n\x06points\x18\x01 \x03(\x0b\x32\".lemegeton.common.geometry.Vector3\"*\n\x07Vector3\x12\t\n\x01x\x18\x01 \x01(\x01\x12\t\n\x01y\x18\x02 \x01(\x01\x12\t\n\x01z\x18\x03 \x01(\x01\">\n\x08Polygon3\x12\x32\n\x06points\x18\x01 \x03(\x0b\x32\".lemegeton.common.geometry.Vector3\"8\n\nQuaternion\x12\t\n\x01x\x18\x01 \x01(\x01\x12\t\n\x01y\x18\x02 \x01(\x01\x12\t\n\x01z\x18\x03 \x01(\x01\x12\t\n\x01w\x18\x04 \x01(\x01\"x\n\x04Pose\x12\x34\n\x08position\x18\x01 \x01(\x0b\x32\".lemegeton.common.geometry.Vector3\x12:\n\x0borientation\x18\x02 \x01(\x0b\x32%.lemegeton.common.geometry.Quaternion\"}\n\tTransform\x12\x37\n\x0btranslation\x18\x01 \x01(\x0b\x32\".lemegeton.common.geometry.Vector3\x12\x37\n\x08rotation\x18\x02 \x01(\x0b\x32%.lemegeton.common.geometry.Quaternion\"p\n\x05Twist\x12\x32\n\x06linear\x18\x01 \x01(\x0b\x32\".lemegeton.common.geometry.Vector3\x12\x33\n\x07\x61ngular\x18\x02 \x01(\x0b\x32\".lemegeton.common.geometry.Vector3\"p\n\x05\x41\x63\x63\x65l\x12\x32\n\x06linear\x18\x01 \x01(\x0b\x32\".lemegeton.common.geometry.Vector3\x12\x33\n\x07\x61ngular\x18\x02 \x01(\x0b\x32\".lemegeton.common.geometry.Vector3\"o\n\x06Wrench\x12\x31\n\x05\x66orce\x18\x01 \x01(\x0b\x32\".lemegeton.common.geometry.Vector3\x12\x32\n\x06torque\x18\x02 \x01(\x0b\x32\".lemegeton.common.geometry.Vector3\"W\n\x07Inertia\x12\x0b\n\x03ixx\x18\x01 \x01(\x01\x12\x0b\n\x03ixy\x18\x02 \x01(\x01\x12\x0b\n\x03ixz\x18\x03 \x01(\x01\x12\x0b\n\x03iyy\x18\x04 \x01(\x01\x12\x0b\n\x03iyz\x18\x05 \x01(\x01\x12\x0b\n\x03izz\x18\x06 \x01(\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n#lemegeton/msg/common/geometry.proto\x12\x1dlemegeton.msg.common.geometry\"\x1f\n\x07Vector2\x12\t\n\x01x\x18\x01 \x01(\x01\x12\t\n\x01y\x18\x02 \x01(\x01\"B\n\x08Polygon2\x12\x36\n\x06points\x18\x01 \x03(\x0b\x32&.lemegeton.msg.common.geometry.Vector3\"*\n\x07Vector3\x12\t\n\x01x\x18\x01 \x01(\x01\x12\t\n\x01y\x18\x02 \x01(\x01\x12\t\n\x01z\x18\x03 \x01(\x01\"B\n\x08Polygon3\x12\x36\n\x06points\x18\x01 \x03(\x0b\x32&.lemegeton.msg.common.geometry.Vector3\"8\n\nQuaternion\x12\t\n\x01x\x18\x01 \x01(\x01\x12\t\n\x01y\x18\x02 \x01(\x01\x12\t\n\x01z\x18\x03 \x01(\x01\x12\t\n\x01w\x18\x04 \x01(\x01\"\x80\x01\n\x04Pose\x12\x38\n\x08position\x18\x01 \x01(\x0b\x32&.lemegeton.msg.common.geometry.Vector3\x12>\n\x0borientation\x18\x02 \x01(\x0b\x32).lemegeton.msg.common.geometry.Quaternion\"\x85\x01\n\tTransform\x12;\n\x0btranslation\x18\x01 \x01(\x0b\x32&.lemegeton.msg.common.geometry.Vector3\x12;\n\x08rotation\x18\x02 \x01(\x0b\x32).lemegeton.msg.common.geometry.Quaternion\"x\n\x05Twist\x12\x36\n\x06linear\x18\x01 \x01(\x0b\x32&.lemegeton.msg.common.geometry.Vector3\x12\x37\n\x07\x61ngular\x18\x02 \x01(\x0b\x32&.lemegeton.msg.common.geometry.Vector3\"x\n\x05\x41\x63\x63\x65l\x12\x36\n\x06linear\x18\x01 \x01(\x0b\x32&.lemegeton.msg.common.geometry.Vector3\x12\x37\n\x07\x61ngular\x18\x02 \x01(\x0b\x32&.lemegeton.msg.common.geometry.Vector3\"w\n\x06Wrench\x12\x35\n\x05\x66orce\x18\x01 \x01(\x0b\x32&.lemegeton.msg.common.geometry.Vector3\x12\x36\n\x06torque\x18\x02 \x01(\x0b\x32&.lemegeton.msg.common.geometry.Vector3\"W\n\x07Inertia\x12\x0b\n\x03ixx\x18\x01 \x01(\x01\x12\x0b\n\x03ixy\x18\x02 \x01(\x01\x12\x0b\n\x03ixz\x18\x03 \x01(\x01\x12\x0b\n\x03iyy\x18\x04 \x01(\x01\x12\x0b\n\x03iyz\x18\x05 \x01(\x01\x12\x0b\n\x03izz\x18\x06 \x01(\x01\x62\x06proto3')
 
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, globals())
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'lemegeton.msg.common.geometry_pb2', globals())
 if _descriptor._USE_C_DESCRIPTORS == False:
 
   DESCRIPTOR._options = None
-  _VECTOR2._serialized_start=66
-  _VECTOR2._serialized_end=97
-  _POLYGON2._serialized_start=99
-  _POLYGON2._serialized_end=161
-  _VECTOR3._serialized_start=163
-  _VECTOR3._serialized_end=205
-  _POLYGON3._serialized_start=207
-  _POLYGON3._serialized_end=269
-  _QUATERNION._serialized_start=271
-  _QUATERNION._serialized_end=327
-  _POSE._serialized_start=329
-  _POSE._serialized_end=449
-  _TRANSFORM._serialized_start=451
-  _TRANSFORM._serialized_end=576
-  _TWIST._serialized_start=578
-  _TWIST._serialized_end=690
-  _ACCEL._serialized_start=692
-  _ACCEL._serialized_end=804
-  _WRENCH._serialized_start=806
-  _WRENCH._serialized_end=917
-  _INERTIA._serialized_start=919
-  _INERTIA._serialized_end=1006
+  _VECTOR2._serialized_start=70
+  _VECTOR2._serialized_end=101
+  _POLYGON2._serialized_start=103
+  _POLYGON2._serialized_end=169
+  _VECTOR3._serialized_start=171
+  _VECTOR3._serialized_end=213
+  _POLYGON3._serialized_start=215
+  _POLYGON3._serialized_end=281
+  _QUATERNION._serialized_start=283
+  _QUATERNION._serialized_end=339
+  _POSE._serialized_start=342
+  _POSE._serialized_end=470
+  _TRANSFORM._serialized_start=473
+  _TRANSFORM._serialized_end=606
+  _TWIST._serialized_start=608
+  _TWIST._serialized_end=728
+  _ACCEL._serialized_start=730
+  _ACCEL._serialized_end=850
+  _WRENCH._serialized_start=852
+  _WRENCH._serialized_end=971
+  _INERTIA._serialized_start=973
+  _INERTIA._serialized_end=1060
 # @@protoc_insertion_point(module_scope)

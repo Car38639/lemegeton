@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package lemegeton.common.std_msgs;
+package lemegeton.msg.common.std_msgs;
 
 import "google/protobuf/empty.proto";
 

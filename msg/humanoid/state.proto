@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package lemegeton.humanoid.state;
+package my_pkg.msg.humanoid.state;
 
 import "google/protobuf/timestamp.proto";
 import "lemegeton/msg/common/manipulator.proto";
@@ -9,7 +9,7 @@ message StateMessage {
 string type = 1; // inspire_hand, ...
   repeated string field = 2;
   int32 dof = 3;
-  lemegeton.common.manipulator.JointState jointstate = 4;
+  lemegeton.msg.common.manipulator.JointState jointstate = 4;
 }
 
 message State {
