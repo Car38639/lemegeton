@@ -14,23 +14,23 @@ _sym_db = _symbol_database.Default()
 from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n#lemegeton/msg/common/std_msgs.proto\x12\x19lemegeton.common.std_msgs\x1a\x1bgoogle/protobuf/empty.proto\"\x15\n\x04\x42ool\x12\r\n\x05value\x18\x01 \x01(\x08\"\x17\n\x06String\x12\r\n\x05value\x18\x01 \x01(\t\"\x14\n\x03Int\x12\r\n\x05value\x18\x01 \x01(\x05\"\x16\n\x05\x46loat\x12\r\n\x05value\x18\x01 \x01(\x02\"\x17\n\x06\x44ouble\x12\r\n\x05value\x18\x01 \x01(\x01\".\n\x05\x45mpty\x12%\n\x05value\x18\x01 \x01(\x0b\x32\x16.google.protobuf.Emptyb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n#lemegeton/msg/common/std_msgs.proto\x12\x1dlemegeton.msg.common.std_msgs\x1a\x1bgoogle/protobuf/empty.proto\"\x15\n\x04\x42ool\x12\r\n\x05value\x18\x01 \x01(\x08\"\x17\n\x06String\x12\r\n\x05value\x18\x01 \x01(\t\"\x14\n\x03Int\x12\r\n\x05value\x18\x01 \x01(\x05\"\x16\n\x05\x46loat\x12\r\n\x05value\x18\x01 \x01(\x02\"\x17\n\x06\x44ouble\x12\r\n\x05value\x18\x01 \x01(\x01\".\n\x05\x45mpty\x12%\n\x05value\x18\x01 \x01(\x0b\x32\x16.google.protobuf.Emptyb\x06proto3')
 
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, globals())
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'lemegeton.msg.common.std_msgs_pb2', globals())
 if _descriptor._USE_C_DESCRIPTORS == False:
 
   DESCRIPTOR._options = None
-  _BOOL._serialized_start=95
-  _BOOL._serialized_end=116
-  _STRING._serialized_start=118
-  _STRING._serialized_end=141
-  _INT._serialized_start=143
-  _INT._serialized_end=163
-  _FLOAT._serialized_start=165
-  _FLOAT._serialized_end=187
-  _DOUBLE._serialized_start=189
-  _DOUBLE._serialized_end=212
-  _EMPTY._serialized_start=214
-  _EMPTY._serialized_end=260
+  _BOOL._serialized_start=99
+  _BOOL._serialized_end=120
+  _STRING._serialized_start=122
+  _STRING._serialized_end=145
+  _INT._serialized_start=147
+  _INT._serialized_end=167
+  _FLOAT._serialized_start=169
+  _FLOAT._serialized_end=191
+  _DOUBLE._serialized_start=193
+  _DOUBLE._serialized_end=216
+  _EMPTY._serialized_start=218
+  _EMPTY._serialized_end=264
 # @@protoc_insertion_point(module_scope)
