@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package humanoid.connection;
+
+message StateConnection {
+  string topic = 1;
+}
+
+message ControlConnection {
+    string ip_address = 1;
+    string topic = 2;
+}

@@ -1,3 +1,15 @@
-from .gateway import Gateway, create_puller, create_requester, create_subscriber
+from .gateway import (
+    GATEWAY_PORT,
+    Gateway,
+    create_puller,
+    create_requester,
+    create_subscriber,
+)
 
-__all__ = ["Gateway", "create_subscriber", "create_requester", "create_puller"]
+__all__ = [
+    "Gateway",
+    "GATEWAY_PORT",
+    "create_subscriber",
+    "create_requester",
+    "create_puller",
+]
