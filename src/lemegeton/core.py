@@ -28,10 +28,15 @@ class Publisher:
     """
 
     def __init__(
-        self, message_class, context: Optional[zmq.Context] = None, port: int = 60001
+        self,
+        message_class,
+        context: Optional[zmq.Context] = None,
+        ip_address: Optional[str] = None,
+        port: int = 60001,
     ):
         self._message_class = message_class
         self._port = port
+        self._ip_address = ip_address
 
         if context is None:
             context = zmq.Context()
@@ -43,7 +48,10 @@ class Publisher:
 
         self._socket = self._context.socket(zmq.PUB)
         self._socket.setsockopt(zmq.SNDHWM, 1)
-        self._socket.bind(f"tcp://*:{self._port}")
+        if self._ip_address:
+            self._socket.connect(f"tcp://{self._ip_address}:{self._port}")
+        else:
+            self._socket.bind(f"tcp://*:{self._port}")
 
     def publish(self, message):
         if not isinstance(message, self._message_class):
@@ -70,7 +78,7 @@ class Subscriber:
         message_class,
         callback,
         context: Optional[zmq.Context] = None,
-        ip_address: str = "localhost",
+        ip_address: Optional[str] = None,
         port: int = 60001,
     ):
         self._message_class = message_class
@@ -86,7 +94,10 @@ class Subscriber:
         self._context = context
         self._socket = self._context.socket(zmq.SUB)
         self._socket.setsockopt(zmq.RCVHWM, 1)
-        self._socket.connect(f"tcp://{self._ip_address}:{self._port}")
+        if self._ip_address:
+            self._socket.connect(f"tcp://{self._ip_address}:{self._port}")
+        else:
+            self._socket.bind(f"tcp://*:{self._port}")
         self._socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
         self._sub_stop_event = threading.Event()
@@ -127,7 +138,7 @@ class Requester:
         message_class,
         response_class,
         context: Optional[zmq.Context] = None,
-        ip_address: str = "localhost",
+        ip_address: Optional[str] = None,
         port: int = 60001,
     ):
         self._message_class = message_class
@@ -143,7 +154,10 @@ class Requester:
         self._socket = self._context.socket(zmq.REQ)
         self._socket.setsockopt(zmq.RCVHWM, 1)
         self._socket.setsockopt(zmq.LINGER, 0)
-        self._socket.connect(f"tcp://{self._ip_address}:{self._port}")
+        if self._ip_address:
+            self._socket.connect(f"tcp://{self._ip_address}:{self._port}")
+        else:
+            self._socket.bind(f"tcp://*:{self._port}")
 
     def request(self, message):
         if not isinstance(message, self._message_class):
@@ -178,11 +192,13 @@ class Responder:
         response_class,
         callback,
         context: Optional[zmq.Context] = None,
+        ip_address: Optional[str] = None,
         port: int = 60001,
     ):
         self._message_class = message_class
         self._response_class = response_class
         self._callback = callback
+        self._ip_address = ip_address
         self._port = port
 
         if context is None:
@@ -195,7 +211,10 @@ class Responder:
 
         self._socket = self._context.socket(zmq.REP)
         self._socket.setsockopt(zmq.SNDHWM, 1)
-        self._socket.bind(f"tcp://*:{self._port}")
+        if self._ip_address:
+            self._socket.connect(f"tcp://{self._ip_address}:{self._port}")
+        else:
+            self._socket.bind(f"tcp://*:{self._port}")
 
         self._server_stop_event = threading.Event()
         self._server_thread = threading.Thread(target=self._serve, daemon=True)
@@ -246,9 +265,11 @@ class Pusher:
         self,
         message_class,
         context: Optional[zmq.Context] = None,
+        ip_address: Optional[str] = None,
         port: int = 60001,
     ):
         self._message_class = message_class
+        self._ip_address = ip_address
         self._port = port
 
         if context is None:
@@ -258,10 +279,12 @@ class Pusher:
             self._use_temp_context = False
 
         self._context = context
-
         self._socket = self._context.socket(zmq.PUSH)
         self._socket.setsockopt(zmq.SNDHWM, 1)
-        self._socket.bind(f"tcp://*:{self._port}")
+        if self._ip_address:
+            self._socket.connect(f"tcp://{self._ip_address}:{self._port}")
+        else:
+            self._socket.bind(f"tcp://*:{self._port}")
 
     def push(self, message):
         if not isinstance(message, self._message_class):
@@ -293,7 +316,7 @@ class Puller:
         message_class,
         callback,
         context: Optional[zmq.Context] = None,
-        ip_address: str = "localhost",
+        ip_address: Optional[str] = None,
         port: int = 60001,
     ):
         self._message_class = message_class
@@ -309,7 +332,10 @@ class Puller:
         self._context = context
         self._socket = self._context.socket(zmq.PULL)
         self._socket.setsockopt(zmq.RCVHWM, 1)
-        self._socket.connect(f"tcp://{self._ip_address}:{self._port}")
+        if self._ip_address:
+            self._socket.connect(f"tcp://{self._ip_address}:{self._port}")
+        else:
+            self._socket.bind(f"tcp://*:{self._port}")
 
         self._pull_stop_event = threading.Event()
         self._pull_thread = threading.Thread(target=self._pull_process, daemon=True)
