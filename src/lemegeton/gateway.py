@@ -1,5 +1,6 @@
 import importlib
 import socket
+from typing import Optional
 
 import zmq
 from google.protobuf.json_format import MessageToDict, ParseDict
@@ -47,26 +48,70 @@ class Gateway:
         response_struct = ParseDict(info, Struct())
         return response_struct
 
-    def register_publisher(self, name, message_class):
+    def _query_protocol_info(
+        self,
+        name: str,
+        ip_address: str,
+        port: int,
+        timeout: int = 2000,
+    ) -> dict:
+        context = zmq.Context()
+        socket = context.socket(zmq.REQ)
+        socket.setsockopt(zmq.RCVTIMEO, timeout)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.connect(f"tcp://{ip_address}:{port}")
+        request_struct = Struct()
+        request_struct["name"] = name
+        try:
+            socket.send(request_struct.SerializeToString())
+            response_bytes = socket.recv()
+            response_struct = Struct()
+            response_struct.ParseFromString(response_bytes)
+            info = MessageToDict(response_struct)
+            if info.get("port") is not None:
+                protocol_type = info.get("type")
+                port = int(info.get("port"))
+                ret = (protocol_type, port)
+
+            else:
+                print(f"Protocol '{name}' not found in gateway {ip_address}:{port}.")
+                ret = (None, None)
+        except zmq.Again:
+            print(
+                f"Failed to query protocol '{name}' from gateway at {ip_address}:{port}."
+            )
+            ret = (None, None)
+        finally:
+            socket.close()
+            context.term()
+            return ret
+
+    def register_publisher(self, name, message_class, ip_address: Optional[str] = None):
         if name in self._protocol_list:
             raise ValueError(f"Protocol '{name}' is already registered.")
         port = _allocate_port()
         protocol = Publisher(
             message_class=message_class,
             context=self._context,
+            ip_address=ip_address,
             port=port,
         )
         self._protocol_list[name] = {
             "protocol": protocol,
             "info": {
                 "type": "publisher",
-                "message_class": _get_message_import_path(message_class),
-                "response_class": None,
                 "port": port,
             },
         }
 
-    def register_responder(self, name, message_class, response_class, callback):
+    def register_responder(
+        self,
+        name,
+        message_class,
+        response_class,
+        callback,
+        ip_address: Optional[str] = None,
+    ):
         if name in self._protocol_list:
             raise ValueError(f"Protocol '{name}' is already registered.")
         port = _allocate_port()
@@ -75,38 +120,166 @@ class Gateway:
             message_class=message_class,
             callback=callback,
             context=self._context,
+            ip_address=ip_address,
             port=port,
         )
         self._protocol_list[name] = {
             "protocol": protocol,
             "info": {
                 "type": "responder",
-                "message_class": _get_message_import_path(message_class),
-                "response_class": _get_message_import_path(response_class)
-                if response_class
-                else None,
                 "port": port,
+                "binding": ip_address if ip_address else "*",
             },
         }
 
-    def register_pusher(self, name, message_class):
+    def register_pusher(
+        self,
+        name,
+        message_class,
+        ip_address: Optional[str] = None,
+    ):
         if name in self._protocol_list:
             raise ValueError(f"Protocol '{name}' is already registered.")
         port = _allocate_port()
         protocol = Pusher(
             message_class=message_class,
             context=self._context,
+            ip_address=ip_address,
             port=port,
         )
         self._protocol_list[name] = {
             "protocol": protocol,
             "info": {
                 "type": "pusher",
-                "message_class": _get_message_import_path(message_class),
-                "response_class": None,
                 "port": port,
+                "binding": ip_address if ip_address else "*",
             },
         }
+
+    def _get_protocol_setting(
+        self,
+        name: str,
+        corresponding_protocol_type: str,
+        ip_address: Optional[str] = None,
+        port: Optional[int] = None,
+    ):
+        """
+        server 模式： binding *:(auto allocated_port)
+        client 模式： connect IP:port, 資訊從 gateway 取得
+        """
+        if ip_address is not None and port is None:
+            raise ValueError("Port must be provided when IP address is specified.")
+        elif ip_address is None and port is not None:
+            raise ValueError("IP address must be provided when port is specified.")
+
+        elif ip_address is not None and port is not None:
+            protocol_type, port = self._query_protocol_info(
+                name, ip_address=ip_address, port=port
+            )
+
+            if protocol_type is None:
+                raise ValueError(
+                    f"Protocol '{name}' not found in gateway at {ip_address}:{port}."
+                )
+
+            if protocol_type != corresponding_protocol_type:
+                raise ValueError(
+                    f"Protocol '{name}' is {protocol_type}, not {corresponding_protocol_type}."
+                )
+            return ip_address, port
+
+        elif ip_address is None and port is None:
+            return None, _allocate_port()
+
+    def register_subscriber(
+        self,
+        name,
+        message_class,
+        callback,
+        port: Optional[int] = None,
+        ip_address: Optional[str] = None,
+    ):
+        ip_address, port = self._get_protocol_setting(
+            name,
+            corresponding_protocol_type="publisher",
+            ip_address=ip_address,
+            port=port,
+        )
+
+        protocol = Subscriber(
+            message_class=message_class,
+            ip_address=ip_address,
+            port=port,
+            callback=callback,
+        )
+        # self._protocol_list[name] = {
+        #     "protocol": protocol,
+        #     "info": {
+        #         "type": "subscriber",
+        #         "port": port,
+        #         "binding": ip_address if ip_address else "*",
+        #     },
+        # }
+
+    def register_puller(
+        self,
+        name,
+        message_class,
+        callback,
+        port: Optional[int] = None,
+        ip_address: Optional[str] = None,
+    ):
+        ip_address, port = self._get_protocol_setting(
+            name,
+            corresponding_protocol_type="pusher",
+            ip_address=ip_address,
+            port=port,
+        )
+
+        protocol = Puller(
+            message_class=message_class,
+            ip_address=ip_address,
+            port=port,
+            callback=callback,
+        )
+        # self._protocol_list[name] = {
+        #     "protocol": protocol,
+        #     "info": {
+        #         "type": "puller",
+        #         "port": port,
+        #         "binding": ip_address if ip_address else "*",
+        #     },
+        # }
+
+    def register_requester(
+        self,
+        name,
+        message_class,
+        response_class,
+        ip_address: Optional[str] = None,
+        port: Optional[int] = None,
+    ):
+        ip_address, port = self._get_protocol_setting(
+            name,
+            corresponding_protocol_type="responder",
+            ip_address=ip_address,
+            port=port,
+        )
+
+        protocol = Requester(
+            response_class=response_class,
+            message_class=message_class,
+            ip_address=ip_address,
+            port=port,
+        )
+        # self._protocol_list[name] = {
+        #     "protocol": protocol,
+        #     "info": {
+        #         "type": "requester",
+        #         "port": port,
+        #         "binding": ip_address if ip_address else "*",
+        #     },
+        # }
 
     def send(self, name, message):
         if name not in self._protocol_list:
@@ -134,108 +307,3 @@ class Gateway:
         for protocol_info in self._protocol_list.values():
             protocol_info["protocol"].close()
         self._context.term()
-
-
-def _query_protocol_info(
-    name: str, ip_address: str, port: int, timeout: int = 2000
-) -> dict:
-    context = zmq.Context()
-    socket = context.socket(zmq.REQ)
-    socket.setsockopt(zmq.RCVTIMEO, timeout)
-    socket.setsockopt(zmq.LINGER, 0)
-    socket.connect(f"tcp://{ip_address}:{port}")
-    request_struct = Struct()
-    request_struct["name"] = name
-    try:
-        socket.send(request_struct.SerializeToString())
-        response_bytes = socket.recv()
-        response_struct = Struct()
-        response_struct.ParseFromString(response_bytes)
-        info = MessageToDict(response_struct)
-        if info.get("port") is not None:
-            protocol_type = info.get("type")
-            port = int(info.get("port"))
-            message_class = _get_message_class(info.get("message_class"))
-            response_class = (
-                _get_message_class(info.get("response_class"))
-                if info.get("response_class")
-                else None
-            )
-            ret = (protocol_type, port, message_class, response_class)
-
-        else:
-            print(f"Protocol '{name}' not found in gateway {ip_address}:{port}.")
-            ret = (None, None, None, None)
-    except zmq.Again:
-        print(f"Failed to query protocol '{name}' from gateway at {ip_address}:{port}.")
-        ret = (None, None, None, None)
-    finally:
-        socket.close()
-        context.term()
-        return ret
-
-
-def create_subscriber(name, ip_address, callback, port: int = GATEWAY_PORT):
-    protocol_type, protocol_port, message_class, _ = _query_protocol_info(
-        name, ip_address=ip_address, port=port
-    )
-    if protocol_type is None:
-        raise ValueError(
-            f"Protocol '{name}' not found in gateway at {ip_address}:{port}."
-        )
-
-    if protocol_type != "publisher":
-        raise ValueError(f"Protocol '{name}' is {protocol_type}.")
-    if callback is None:
-        raise ValueError(
-            f"Callback function must be provided for subscriber protocol '{name}'."
-        )
-    return Subscriber(
-        message_class=message_class,
-        ip_address=ip_address,
-        port=protocol_port,
-        callback=callback,
-    )
-
-
-def create_requester(name, ip_address, port: int = GATEWAY_PORT):
-    protocol_type, protocol_port, message_class, response_class = _query_protocol_info(
-        name, ip_address=ip_address, port=port
-    )
-    if protocol_type is None:
-        raise ValueError(
-            f"Protocol '{name}' not found in gateway at {ip_address}:{port}."
-        )
-
-    if protocol_type != "responder":
-        raise ValueError(f"Protocol '{name}' is {protocol_type}.")
-    return Requester(
-        response_class=response_class,
-        message_class=message_class,
-        ip_address=ip_address,
-        port=protocol_port,
-    )
-
-
-def create_puller(name, ip_address, callback, port: int = GATEWAY_PORT):
-    protocol_type, protocol_port, message_class, _ = _query_protocol_info(
-        name, ip_address=ip_address, port=port
-    )
-    if protocol_type is None:
-        raise ValueError(
-            f"Protocol '{name}' not found in gateway at {ip_address}:{port}."
-        )
-
-    if protocol_type != "pusher":
-        raise ValueError(f"Protocol '{name}' is {protocol_type}.")
-    if callback is None:
-        raise ValueError(
-            f"Callback function must be provided for subscriber protocol '{name}'."
-        )
-
-    return Puller(
-        message_class=message_class,
-        ip_address=ip_address,
-        port=protocol_port,
-        callback=callback,
-    )
