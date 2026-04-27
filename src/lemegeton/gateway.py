@@ -38,7 +38,7 @@ class Gateway:
     REGISTRY_PATH = "@lemegeton_registry"
     HEARTBEAT_PATH = "@lemegeton_heartbeat"
     HEARTBEAT_RATE = 10  # 每 10 秒發送一次心跳
-    DEFAULT_QUERY_PORT = 5555
+    DEFAULT_QUERY_PORT = 60001
 
     def __init__(
         self, port: Optional[int] = None, redis_conf={"host": "localhost", "port": 6379}
