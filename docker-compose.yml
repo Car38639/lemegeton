@@ -1,6 +1,6 @@
 services:
-  server:
-    container_name: lemegeton
+  test:
+    container_name: test_container
     build:
       context: .
       dockerfile: Dockerfile
@@ -9,6 +9,8 @@ services:
     # restart: always
     runtime: nvidia
     network_mode: host
+    ipc: "host"
+
     working_dir: /root/workspace
     env_file:
       - path: .env
