@@ -1,309 +1,406 @@
-import importlib
-import socket
+import json
+import threading
+import time
+import uuid
+from enum import Enum
 from typing import Optional
 
+import redis
 import zmq
-from google.protobuf.json_format import MessageToDict, ParseDict
-from google.protobuf.struct_pb2 import Struct
-
-from lemegeton.core import Publisher, Puller, Pusher, Requester, Responder, Subscriber
-
-GATEWAY_PORT = 60000
 
 
-def _get_message_import_path(message_class):
-    return f"{message_class.__module__}.{message_class.__name__}"
+class GatewayStatus(Enum):
+    SUCCESS = "SUCCESS"
+    ALREADY_EXISTS = "ALREADY_EXISTS"
+    MISMATCH = "MISMATCH"
+
+    FOUND = "FOUND"
+    NOT_FOUND = "NOT_FOUND"
+
+    INVALID_FORMAT = "INVALID_FORMAT"
 
 
-def _get_message_class(import_path):
-    module_path, class_name = import_path.rsplit(".", 1)
-    module = importlib.import_module(module_path)
-    return getattr(module, class_name)
+class ServiceType(Enum):
+    PUBLISHER = "pub"
+    SUBSCRIBER = "sub"
+    REQUESTER = "req"
+    RESPONDER = "res"
+    PUSHER = "push"
+    PULLER = "pull"
 
 
-def _allocate_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
+class RegistryAction(Enum):
+    REGISTER = "register"
+    UNREGISTER = "unregister"
 
 
 class Gateway:
-    def __init__(self, port: int = GATEWAY_PORT):
-        self._context = zmq.Context()
-        self._query_responder = Responder(
-            response_class=Struct,
-            message_class=Struct,
-            callback=self._handle_query,
-            context=self._context,
-            port=port,
-        )
-        self._protocol_list = {}
+    REGISTRY_PATH = "@lemegeton_registry"
+    HEARTBEAT_PATH = "@lemegeton_heartbeat"
+    HEARTBEAT_RATE = 10  # 每 10 秒發送一次心跳
+    DEFAULT_QUERY_PORT = 5555
 
-    def _handle_query(self, request: Struct) -> Struct:
-        req = MessageToDict(request)
+    def __init__(
+        self, port: Optional[int] = None, redis_conf={"host": "localhost", "port": 6379}
+    ):
+        self.r = redis.Redis(**redis_conf, decode_responses=True)
+        self.local_cache = {}  # 格式: {name: {"data": dict, "last_seen": float}}
+        self.context = zmq.Context()
+        self.ttl = 2 * Gateway.HEARTBEAT_RATE  # 設定2倍心跳的秒數為過期門檻
 
-        info = self._protocol_list.get(req.get("name"), {"info": {"port": None}})[
-            "info"
-        ]
-        response_struct = ParseDict(info, Struct())
-        return response_struct
+        self.registry_sock = self.context.socket(zmq.REP)
+        self.registry_sock.bind(f"ipc://{Gateway.REGISTRY_PATH}")
 
-    def _query_protocol_info(
-        self,
-        name: str,
-        ip_address: str,
-        port: int,
-        timeout: int = 2000,
-    ) -> dict:
-        context = zmq.Context()
-        socket = context.socket(zmq.REQ)
-        socket.setsockopt(zmq.RCVTIMEO, timeout)
-        socket.setsockopt(zmq.LINGER, 0)
-        socket.connect(f"tcp://{ip_address}:{port}")
-        request_struct = Struct()
-        request_struct["name"] = name
+        self.heartbeat_sock = self.context.socket(zmq.REP)
+        self.heartbeat_sock.bind(f"ipc://{Gateway.HEARTBEAT_PATH}")
+
+        # --- 2. TCP 查詢 Socket ---
+        self.query_sock = self.context.socket(zmq.REP)
+        if port is None:
+            port = Gateway.DEFAULT_QUERY_PORT
+        self.query_sock.bind(f"tcp://*:{port}")
+
+        # --- 3. Poller 設定 ---
+        self.poller = zmq.Poller()
+        self.poller.register(self.registry_sock, zmq.POLLIN)
+        self.poller.register(self.heartbeat_sock, zmq.POLLIN)
+        self.poller.register(self.query_sock, zmq.POLLIN)
+
+        self.last_sync_time = time.time()
+
+    def sync_and_cleanup(self):
+        """同步數據至 Redis 並清理本地過期快取"""
+        now = time.time()
+        stale_keys = []
+
+        # 找出已過期的 Key
+        for name, info in self.local_cache.items():
+            if now - info["last_seen"] > self.ttl:
+                stale_keys.append(name)
+
+        # 執行清理
+        for name in stale_keys:
+            del self.local_cache[name]
+            # 同步刪除 Redis 中的資料
+            self.r.delete(f"svc:{name}")
+            print(f"[Cleanup] 服務 {name} 已過期，執行清理")
+
+        # 同步剩餘的活躍數據至 Redis
+        if self.local_cache:
+            pipe = self.r.pipeline()
+            for name, info in self.local_cache.items():
+                pipe.set(f"svc:{name}", json.dumps(info), ex=self.ttl)
+            pipe.execute()
+            print(f"[Sync] 同步 {len(self.local_cache)} 個活躍服務至 Redis")
+
+        self.last_sync_time = now
+
+    def run(self):
+        print("Gateway 啟動成功，進入監聽狀態...")
         try:
-            socket.send(request_struct.SerializeToString())
-            response_bytes = socket.recv()
-            response_struct = Struct()
-            response_struct.ParseFromString(response_bytes)
-            info = MessageToDict(response_struct)
-            if info.get("port") is not None:
-                protocol_type = info.get("type")
-                port = int(info.get("port"))
-                ret = (protocol_type, port)
+            while True:
+                socks = dict(self.poller.poll(1000))
+                # 處理 Unregister (寫入)
+                if self.registry_sock in socks:
+                    msg = self.registry_sock.recv_json()
+                    print(f"[Registry] 收到註冊請求: {msg}")
 
-            else:
-                print(f"Protocol '{name}' not found in gateway {ip_address}:{port}.")
-                ret = (None, None)
-        except zmq.Again:
-            print(
-                f"Failed to query protocol '{name}' from gateway at {ip_address}:{port}."
-            )
-            ret = (None, None)
+                    action = msg.get("action")
+                    name = msg.get("name")
+                    request_service_id = msg.get("service_id")
+
+                    if action == RegistryAction.REGISTER.value:
+                        current_service = self.local_cache.get(name)
+                        if (
+                            current_service
+                            and current_service.get("service_id") != request_service_id
+                        ):
+                            print(
+                                f"[Warning] 服務名稱 '{name}' 已被 {current_service.get('service_id')} 占用！來自 {request_service_id} 的註冊請求被拒絕。"
+                            )
+                            # 名稱已被占用，且 ID 不同
+                            self.registry_sock.send_json(
+                                {"status": GatewayStatus.ALREADY_EXISTS.value}
+                            )
+                        else:
+                            # 新註冊
+                            self.local_cache[name] = {
+                                "data": msg.get("data"),
+                                "service_id": request_service_id,  # 紀錄擁有者 ID
+                                "last_seen": time.time(),
+                            }
+                            self.registry_sock.send_json(
+                                {"status": GatewayStatus.SUCCESS.value}
+                            )
+                    elif action == RegistryAction.UNREGISTER.value:
+                        current_service = self.local_cache.get(name)
+                        if (
+                            current_service
+                            and current_service.get("service_id") == request_service_id
+                        ):
+                            del self.local_cache[name]
+                            self.r.delete(f"svc:{name}")
+                            print(f"[Unregister] 服務 {name} 已被註銷")
+                            self.registry_sock.send_json(
+                                {"status": GatewayStatus.SUCCESS.value}
+                            )
+                        else:
+                            print(
+                                f"[Warning] 嘗試註銷服務 '{name}' 失敗！請求 ID {request_service_id} 與現有服務 ID 不匹配或服務不存在。"
+                            )
+                            self.registry_sock.send_json(
+                                {"status": GatewayStatus.NOT_FOUND.value}
+                            )
+
+                # 處理 IPC 心跳 (寫入)
+                if self.heartbeat_sock in socks:
+                    msg = self.heartbeat_sock.recv_json()
+                    print(f"[Heartbeat] 收到心跳請求: {msg}")
+
+                    name = msg.get("name")
+                    new_service_id = msg.get(
+                        "service_id"
+                    )  # Client 端啟動時產生的唯一 ID
+
+                    current_service = self.local_cache.get(name)
+
+                    if not current_service:
+                        # 本地無此服務，從 Redis 查詢資料
+                        val = self.r.get(f"svc:{name}")
+                        if val:
+                            info = json.loads(val)
+                            if info.get("service_id") != new_service_id:
+                                print(
+                                    f"[Warning] 服務名稱 '{name}' ID 不符合。從 Redis 查詢到的 ID 與心跳請求的 ID 不匹配。"
+                                )
+                                self.heartbeat_sock.send_json(
+                                    {"status": GatewayStatus.MISMATCH.value}
+                                )
+                            else:
+                                self.local_cache[name] = info
+                                print(
+                                    f"[Heartbeat] 服務 '{name}' 從 Redis 回填至本地快取，ID: {new_service_id}"
+                                )
+                                self.heartbeat_sock.send_json(
+                                    {"status": GatewayStatus.SUCCESS.value}
+                                )
+                        else:
+                            print(
+                                f"[Heartbeat] 服務 '{name}' 不存在於本地快取和 Redis 中，將其註冊到本地快取，ID: {new_service_id}"
+                            )
+                            self.local_cache[name] = {
+                                "data": msg.get("data"),
+                                "service_id": new_service_id,
+                                "last_seen": time.time(),
+                            }
+                            self.heartbeat_sock.send_json(
+                                {"status": GatewayStatus.SUCCESS.value}
+                            )
+
+                    elif current_service.get("service_id") != new_service_id:
+                        print(f"[Warning] 服務名稱 '{name}' ID 不符合。")
+                        # ID 不匹配，可能是名稱被占用或服務重啟但 ID 變了
+                        self.heartbeat_sock.send_json(
+                            {"status": GatewayStatus.MISMATCH.value}
+                        )
+                    else:
+                        # 正常心跳，更新心跳時間戳和資料
+                        self.local_cache[name]["last_seen"] = time.time()
+                        self.heartbeat_sock.send_json(
+                            {"status": GatewayStatus.SUCCESS.value}
+                        )
+
+                # 處理 TCP 查詢 (讀取)
+                if self.query_sock in socks:
+                    msg = self.query_sock.recv_json()
+                    name = msg.get("name")
+
+                    res_info = self.local_cache.get(name)
+                    if res_info:
+                        self.query_sock.send_json(
+                            {
+                                "status": GatewayStatus.FOUND.value,
+                                "data": res_info["data"],
+                            }
+                        )
+                    else:
+                        # 本地無則查 Redis
+                        val = self.r.get(f"svc:{name}")
+                        if val:
+                            data = json.loads(val)
+                            # 回填本地快取
+                            self.local_cache[name] = {
+                                "data": data,
+                                "last_seen": time.time(),
+                            }
+                            self.query_sock.send_json(
+                                {"status": GatewayStatus.FOUND.value, "data": data}
+                            )
+                        else:
+                            self.query_sock.send_json(
+                                {"status": GatewayStatus.NOT_FOUND.value}
+                            )
+
+                # 每 5 秒執行一次同步與清理
+                if time.time() - self.last_sync_time > 5:
+                    self.sync_and_cleanup()
+
+        except KeyboardInterrupt:
+            print("\nServer is shutting down...")
         finally:
-            socket.close()
-            context.term()
-            return ret
+            self.query_sock.close()
+            self.registry_sock.close()
+            self.heartbeat_sock.close()
+            self.context.term()
 
-    def register_publisher(self, name, message_class, ip_address: Optional[str] = None):
-        if name in self._protocol_list:
-            raise ValueError(f"Protocol '{name}' is already registered.")
-        port = _allocate_port()
-        protocol = Publisher(
-            message_class=message_class,
-            context=self._context,
-            ip_address=ip_address,
-            port=port,
-        )
-        self._protocol_list[name] = {
-            "protocol": protocol,
-            "info": {
-                "type": "publisher",
-                "port": port,
-            },
-        }
 
-    def register_responder(
+class HeartbeatClient:
+    def __init__(
         self,
+        context,
         name,
-        message_class,
-        response_class,
-        callback,
-        ip_address: Optional[str] = None,
+        data,
+        registry_path=Gateway.REGISTRY_PATH,
+        heartbeat_path=Gateway.HEARTBEAT_PATH,
     ):
-        if name in self._protocol_list:
-            raise ValueError(f"Protocol '{name}' is already registered.")
-        port = _allocate_port()
-        protocol = Responder(
-            response_class=response_class,
-            message_class=message_class,
-            callback=callback,
-            context=self._context,
-            ip_address=ip_address,
-            port=port,
+        self.context = context
+        self.registry_path = registry_path
+        self.heartbeat_path = heartbeat_path
+        self.name = name
+        self.data = data
+        self.service_id = str(uuid.uuid4())  # 生成本次啟動的唯一身份標籤
+        res = self._register_service()
+        if not res:
+            self.registry_sock.close()
+            self.heartbeat_sock.close()
+            raise Exception(f"[{self.name}] Service registration failed")
+
+        self._heartbeat_event = threading.Event()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, daemon=True
         )
-        self._protocol_list[name] = {
-            "protocol": protocol,
-            "info": {
-                "type": "responder",
-                "port": port,
-                "binding": ip_address if ip_address else "*",
-            },
-        }
+        self._heartbeat_thread.start()
 
-    def register_pusher(
-        self,
-        name,
-        message_class,
-        ip_address: Optional[str] = None,
-    ):
-        if name in self._protocol_list:
-            raise ValueError(f"Protocol '{name}' is already registered.")
-        port = _allocate_port()
-        protocol = Pusher(
-            message_class=message_class,
-            context=self._context,
-            ip_address=ip_address,
-            port=port,
-        )
-        self._protocol_list[name] = {
-            "protocol": protocol,
-            "info": {
-                "type": "pusher",
-                "port": port,
-                "binding": ip_address if ip_address else "*",
-            },
-        }
+    def _reset_sockets(self):
+        self.registry_sock.close()
+        self.heartbeat_sock.close()
+        return self._register_service()
 
-    def _get_protocol_setting(
-        self,
-        name: str,
-        corresponding_protocol_type: str,
-        ip_address: Optional[str] = None,
-        port: Optional[int] = None,
-    ):
-        """
-        server 模式： binding *:(auto allocated_port)
-        client 模式： connect IP:port, 資訊從 gateway 取得
-        """
-        if ip_address is not None and port is None:
-            raise ValueError("Port must be provided when IP address is specified.")
-        elif ip_address is None and port is not None:
-            raise ValueError("IP address must be provided when port is specified.")
+    def _register_service(self):
+        self.registry_sock = self.context.socket(zmq.REQ)
+        # 設定接收超時，避免死鎖
+        self.registry_sock.setsockopt(zmq.RCVTIMEO, 3000)
+        # 確保關閉時不阻塞
+        self.registry_sock.setsockopt(zmq.LINGER, 0)
+        # 允許在還沒recv的情況下再次 send
+        self.registry_sock.setsockopt(zmq.REQ_RELAXED, 1)
+        # 自動關聯請求與回覆，避免舊回覆干擾新請求
+        self.registry_sock.setsockopt(zmq.REQ_CORRELATE, 1)
+        self.registry_sock.connect(f"ipc://{self.registry_path}")
 
-        elif ip_address is not None and port is not None:
-            protocol_type, port = self._query_protocol_info(
-                name, ip_address=ip_address, port=port
+        self.heartbeat_sock = self.context.socket(zmq.REQ)
+        # 設定接收超時，避免死鎖
+        self.heartbeat_sock.setsockopt(zmq.RCVTIMEO, 1000)
+        # 確保關閉時不阻塞
+        self.heartbeat_sock.setsockopt(zmq.LINGER, 0)
+        # 允許在還沒recv的情況下再次 send
+        self.heartbeat_sock.setsockopt(zmq.REQ_RELAXED, 1)
+        # 自動關聯請求與回覆，避免舊回覆干擾新請求
+        self.heartbeat_sock.setsockopt(zmq.REQ_CORRELATE, 1)
+        self.heartbeat_sock.connect(f"ipc://{self.heartbeat_path}")
+        try:
+            self.registry_sock.send_json(
+                {
+                    "action": RegistryAction.REGISTER.value,
+                    "name": self.name,
+                    "service_id": self.service_id,
+                    "data": self.data,
+                }
             )
+            resp = self.registry_sock.recv_json()
 
-            if protocol_type is None:
-                raise ValueError(
-                    f"Protocol '{name}' not found in gateway at {ip_address}:{port}."
+            if resp.get("status") == GatewayStatus.ALREADY_EXISTS.value:
+                # print(
+                #     f"[{self.name}] Service '{self.name}' already exists with a different ID."
+                # )
+                return False
+            else:
+                return True
+        except zmq.Again:
+            # print(f"[{self.name}][Error] Gateway 無回應!")
+            return False
+
+    def _heartbeat_loop(self):
+        while not self._heartbeat_event.is_set():
+            try:
+                self.heartbeat_sock.send_json(
+                    {
+                        "name": self.name,
+                        "service_id": self.service_id,
+                        "data": self.data,
+                    }
                 )
+                resp = self.heartbeat_sock.recv_json()
 
-            if protocol_type != corresponding_protocol_type:
-                raise ValueError(
-                    f"Protocol '{name}' is {protocol_type}, not {corresponding_protocol_type}."
-                )
-            return ip_address, port
+                if resp.get("status") == GatewayStatus.ALREADY_EXISTS.value:
+                    # print(
+                    #     f"[{self.name}]  ID mismatch detected. Another service with the same name is active."
+                    # )
 
-        elif ip_address is None and port is None:
-            return None, _allocate_port()
+                    self._heartbeat_event.set()  # 停止心跳，避免干擾他人
+                    self.heartbeat_sock.close()
+                    break
+            except zmq.Again:
+                # print(f"[{self.name}] Heartbeat timeout. No response from Gateway.")
+                # if self._reset_sockets():
+                #     print(
+                #         f"[{self.name}] Successfully re-registered after heartbeat timeout."
+                #     )
+                # else:
+                #     print(
+                #         f"[{self.name}] Re-registration failed after heartbeat timeout."
+                #     )
+                _ = self._reset_sockets()  # 嘗試重置連線，無論成功與否都繼續下一輪心跳
 
-    def register_subscriber(
-        self,
-        name,
-        message_class,
-        callback,
-        port: Optional[int] = None,
-        ip_address: Optional[str] = None,
-    ):
-        ip_address, port = self._get_protocol_setting(
-            name,
-            corresponding_protocol_type="publisher",
-            ip_address=ip_address,
-            port=port,
-        )
+            heartbeat_period = time.time()
+            while time.time() - heartbeat_period < Gateway.HEARTBEAT_RATE:
+                if self._heartbeat_event.is_set():
+                    # print(f"[{self.name}] Heartbeat loop is stopping...")
+                    break
+                time.sleep(0.1)  # 避免忙等
 
-        protocol = Subscriber(
-            message_class=message_class,
-            ip_address=ip_address,
-            port=port,
-            callback=callback,
-        )
-        # self._protocol_list[name] = {
-        #     "protocol": protocol,
-        #     "info": {
-        #         "type": "subscriber",
-        #         "port": port,
-        #         "binding": ip_address if ip_address else "*",
-        #     },
-        # }
+    def stop(self):
+        self._heartbeat_event.set()
+        if self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join()
+        try:
+            _ = self.registry_sock.send_json(
+                {
+                    "action": RegistryAction.UNREGISTER.value,
+                    "name": self.name,
+                    "service_id": self.service_id,
+                }
+            )
+            recv = self.registry_sock.recv_json()
+            print(f"[{self.name}] Unregister response: {recv}")
+        except zmq.Again:
+            print(f"[{self.name}] Unregister timeout. No response from Gateway.")
+        self.registry_sock.close()
+        self.heartbeat_sock.close()
 
-    def register_puller(
-        self,
-        name,
-        message_class,
-        callback,
-        port: Optional[int] = None,
-        ip_address: Optional[str] = None,
-    ):
-        ip_address, port = self._get_protocol_setting(
-            name,
-            corresponding_protocol_type="pusher",
-            ip_address=ip_address,
-            port=port,
-        )
 
-        protocol = Puller(
-            message_class=message_class,
-            ip_address=ip_address,
-            port=port,
-            callback=callback,
-        )
-        # self._protocol_list[name] = {
-        #     "protocol": protocol,
-        #     "info": {
-        #         "type": "puller",
-        #         "port": port,
-        #         "binding": ip_address if ip_address else "*",
-        #     },
-        # }
-
-    def register_requester(
-        self,
-        name,
-        message_class,
-        response_class,
-        ip_address: Optional[str] = None,
-        port: Optional[int] = None,
-    ):
-        ip_address, port = self._get_protocol_setting(
-            name,
-            corresponding_protocol_type="responder",
-            ip_address=ip_address,
-            port=port,
-        )
-
-        protocol = Requester(
-            response_class=response_class,
-            message_class=message_class,
-            ip_address=ip_address,
-            port=port,
-        )
-        # self._protocol_list[name] = {
-        #     "protocol": protocol,
-        #     "info": {
-        #         "type": "requester",
-        #         "port": port,
-        #         "binding": ip_address if ip_address else "*",
-        #     },
-        # }
-
-    def send(self, name, message):
-        if name not in self._protocol_list:
-            raise ValueError(f"Protocol '{name}' is not registered.")
-        protocol_info = self._protocol_list[name]
-        protocol = protocol_info["protocol"]
-        if isinstance(protocol, Publisher):
-            protocol.publish(message)
-        elif isinstance(protocol, Responder):
-            raise ValueError(f"Protocol '{name}' is a responder. Use 'request' method.")
-        elif isinstance(protocol, Pusher):
-            protocol.push(message)
-        else:
-            raise ValueError(f"Unknown protocol type for '{name}'.")
-
-    def remove(self, name):
-        if name not in self._protocol_list:
-            print(f"Protocol '{name}' is not registered.")
-            return
-        protocol_info = self._protocol_list.pop(name)
-        protocol_info["protocol"].close()
-
-    def close(self):
-        self._query_responder.close()
-        for protocol_info in self._protocol_list.values():
-            protocol_info["protocol"].close()
-        self._context.term()
+def query_service_info(
+    context, name, ip_address="localhost", port=Gateway.DEFAULT_QUERY_PORT, timeout=2000
+):
+    sock = context.socket(zmq.REQ)
+    sock.setsockopt(zmq.RCVTIMEO, timeout)
+    sock.setsockopt(zmq.LINGER, 0)
+    try:
+        sock.connect(f"tcp://{ip_address}:{port}")
+        sock.send_json({"name": name})
+        resp = sock.recv_json()
+    except zmq.Again:
+        resp = None
+    finally:
+        sock.close()
+    return resp

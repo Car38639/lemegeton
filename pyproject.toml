@@ -12,7 +12,7 @@ authors = [
     { name = "Awen Hunag", email = "awen_huang@solomon-3d.com" }
 ]
 # 專案運行所需的第三方套件
-dependencies = []
+dependencies = ["protobuf", "pyzmq", "redis"]
 
 [project.scripts]
 compile_protos = "lemegeton.compile_protos:run_bash"
