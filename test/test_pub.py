@@ -1,22 +1,21 @@
 import time
 
-import zmq
-
 from lemegeton.msg.common.std_msgs_pb2 import String
 
-context = zmq.Context()
+import lemegeton
+
+context = lemegeton.Context()
 
 
 #####################################################################
 
-from lemegeton.server import Publisher
 
-pub = Publisher(context=context, name="test_pub", message_class=String, mode="tcp")
+pub = lemegeton.server.Publisher(
+    context=context, name="test_pub", message_class=String, mode="tcp"
+)
 
 
-# from lemegeton.client import Publisher
-
-# pub = Publisher(
+# pub = lemegeton.client.Publisher(
 #     context=context, name="test_pub", message_class=String, ip_address="localhost"
 # )
 

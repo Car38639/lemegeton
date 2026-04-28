@@ -1,9 +1,8 @@
-import zmq
+import lemegeton
 
-context = zmq.Context()
+context = lemegeton.Context()
 
 from lemegeton.msg.common.std_msgs_pb2 import String
-from lemegeton.server import Responder
 
 
 def message_callback(msg):
@@ -12,7 +11,7 @@ def message_callback(msg):
     return res
 
 
-responder = Responder(
+responder = lemegeton.server.Responder(
     context=context,
     name="test_responder",
     message_class=String,

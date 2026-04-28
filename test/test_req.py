@@ -1,20 +1,18 @@
 import time
 
-import zmq
-
 from lemegeton.msg.common.std_msgs_pb2 import String
 
-context = zmq.Context()
+import lemegeton
+
+context = lemegeton.Context()
 
 
-from lemegeton.client import Requester
-
-req = Requester(
+req = lemegeton.client.Requester(
     context=context,
     name="test_responder",
     message_class=String,
     response_class=String,
-    ip_address="192.168.1.195",
+    ip_address="localhost",  # 指定服務所在的 IP 地址
     timeout=3.0,
 )
 

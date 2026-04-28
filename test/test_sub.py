@@ -1,19 +1,17 @@
-import zmq
-
 from lemegeton.msg.common.std_msgs_pb2 import String
+
+import lemegeton
 
 
 def message_callback(msg):
     print("Received message:", msg.value)
 
 
-context = zmq.Context()
+context = lemegeton.Context()
 
 #####################################################################
 
-# from lemegeton.server import Subscriber
-
-# sub = Subscriber(
+# sub = lemegeton.server.Subscriber(
 #     context=context,
 #     name="test_pub",
 #     message_class=String,
@@ -21,9 +19,8 @@ context = zmq.Context()
 #     mode="ipc",  # 使用 TCP 模式
 # )
 
-from lemegeton.client import Subscriber
 
-sub = Subscriber(
+sub = lemegeton.server.Subscriber(
     context=context,
     name="test_pub",
     message_class=String,
