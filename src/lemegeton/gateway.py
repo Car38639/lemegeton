@@ -9,6 +9,13 @@ import redis
 import zmq
 
 
+class Context(zmq.Context):
+    """ZeroMQ Context 的簡單封裝，保證一致性"""
+
+    def __init__(self):
+        super().__init__()
+
+
 class GatewayStatus(Enum):
     SUCCESS = "SUCCESS"
     ALREADY_EXISTS = "ALREADY_EXISTS"
