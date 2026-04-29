@@ -235,7 +235,7 @@ class Publisher(ServiceCore):
         if self._enable_ipc:
             self._socket.bind(f"ipc://{self._ipc_path}")
 
-    def publish(self, message):
+    def send(self, message):
         if not isinstance(message, self._message_class):
             print(
                 f"[{self._name}] Warning: Wrong message class, expect: {self._message_class.__name__}"
