@@ -20,7 +20,7 @@ context = lemegeton.Context()
 # )
 
 
-sub = lemegeton.server.Subscriber(
+sub = lemegeton.client.Subscriber(
     context=context,
     name="test_pub",
     message_class=String,

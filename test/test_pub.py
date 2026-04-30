@@ -25,7 +25,7 @@ try:
     while True:
         msg = String()
         msg.value = "Hello, Lemegeton!"
-        pub.publish(msg)
+        pub.send(msg)
         print("Published message:", msg.value)
         time.sleep(1)
 except KeyboardInterrupt:

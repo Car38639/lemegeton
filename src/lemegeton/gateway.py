@@ -220,6 +220,7 @@ class Gateway:
                 # 處理 TCP 查詢 (讀取)
                 if self.query_sock in socks:
                     msg = self.query_sock.recv_json()
+                    print(f"[Query] Searching topic {msg.get('name')}......")
                     name = msg.get("name")
 
                     res_info = self.local_cache.get(name)
