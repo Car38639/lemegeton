@@ -18,7 +18,6 @@ responder = lemegeton.server.Responder(
     response_class=String,
     callback=message_callback,
     mode="both",
-    worker_num=4,
 )
 
 try:

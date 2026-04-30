@@ -54,49 +54,6 @@ class ServiceCore:
             return s.getsockname()[1]
 
 
-def _worker_routine(
-    worker_id, backend_ipc_path, message_class, response_class, callback, stop_event
-):
-    context = zmq.Context()
-    socket = context.socket(zmq.REP)
-    socket.connect(f"ipc://{backend_ipc_path}")
-
-    while not stop_event.is_set():
-        try:
-            if not socket.poll(500):
-                continue
-            message_bytes = socket.recv()
-
-            try:
-                message = ProtobufMessageHandler.deserialize(
-                    message_class, message_bytes
-                )
-            except Exception:
-                print(f"Wrong message type, expect:{message_class.__name__}")
-                empty_response = response_class()
-                socket.send(ProtobufMessageHandler.serialize(empty_response))
-                continue
-
-            # Handle the request
-            response_message = callback(message)
-            if not isinstance(response_message, response_class):
-                print(
-                    f"Warning: Wrong message class, expect: {response_class.__name__}"
-                )
-                response_message = response_class()
-
-            response_bytes = ProtobufMessageHandler.serialize(response_message)
-            socket.send(response_bytes)
-        except KeyboardInterrupt:
-            break
-        except zmq.ContextTerminated:
-            break
-        except Exception as e:
-            print(f"[Worker-{worker_id}] Unexpected Error: {e}")
-            break
-    socket.close(linger=0)
-    context.term()
-    print(f"Worker {worker_id} cleaned up and exited.")
 
 
 class Responder(ServiceCore):
@@ -109,7 +66,6 @@ class Responder(ServiceCore):
         callback,
         mode: Literal["tcp", "ipc", "both"] = "tcp",
         port: Optional[int] = None,
-        worker_num: int = 1,
         buffer_size: int = 100,
     ):
         try:
@@ -121,84 +77,76 @@ class Responder(ServiceCore):
         self._response_class = response_class
         self._callback = callback
         self._mode = mode
-        self._worker_num = worker_num
 
-        self._frontend_sock = self._context.socket(zmq.ROUTER)
-        self._frontend_sock.setsockopt(zmq.LINGER, 0)
-        self._frontend_sock.setsockopt(zmq.RCVHWM, buffer_size)
+        self._socket = self._context.socket(zmq.REP)
+        self._socket.setsockopt(zmq.LINGER, 0)
+        self._socket.setsockopt(zmq.RCVHWM, buffer_size)
         if self._enable_tcp:
             try:
-                self._frontend_sock.bind(f"tcp://*:{self._tcp_port}")
+                self._socket.bind(f"tcp://*:{self._tcp_port}")
             except Exception as e:
                 print(f"[{name}] Fail to bind {self._tcp_port}: {e}")
                 raise Exception(f"[{name}] Fail to bind {self._tcp_port}: {e}")
 
         if self._enable_ipc:
-            self._frontend_sock.bind(f"ipc://{self._ipc_path}")
+            self._socket.bind(f"ipc://{self._ipc_path}")
 
-        self._backend_ipc_path = f"/tmp/{self._name}_internal_backend.ipc"
-        self._backend_sock = self._context.socket(zmq.DEALER)
-        self._backend_sock.bind(f"ipc://{self._backend_ipc_path}")
-        self._workers = []
-
-        self._worker_stop_event = multiprocessing.Event()
-        self._routing_thread = threading.Thread(
-            target=self._routing_process, daemon=True
+        self._stop_event = threading.Event()
+        self._response_thread = threading.Thread(
+            target=self._response_process, daemon=True
         )
-        self._routing_thread.start()
+        self._response_thread.start()
 
-    def _routing_process(self):
-        print("[Broker] 啟動中...")
-        if self._enable_tcp:
-            print(f" - 前端 TCP: tcp://*:{self._tcp_port}")
-        if self._enable_ipc:
-            print(f" - 前端 IPC: ipc://{self._ipc_path}")
-        print(
-            f" - 後端分發: {self._backend_ipc_path} (Worker 數量: {self._worker_num})"
-        )
+    def _response_process(self):
+        while not self._stop_event.is_set():
+            try:
+                if not self._socket.poll(100):
+                    continue
 
-        # 啟動 Workers
-        for i in range(self._worker_num):
-            p = multiprocessing.Process(
-                target=_worker_routine,
-                args=(
-                    i,
-                    self._backend_ipc_path,
-                    self._message_class,
-                    self._response_class,
-                    self._callback,
-                    self._worker_stop_event,
-                ),
-            )
-            p.daemon = True
-            p.start()
-            self._workers.append(p)
+                message_bytes = self._socket.recv()
+                try:
+                    message = ProtobufMessageHandler.deserialize(
+                        self._message_class, message_bytes
+                    )
+                except Exception:
+                    print(f"Wrong message type, expect:{self._message_class.__name__}")
+                    empty_response = self._message_class()
+                    self._socket.send(ProtobufMessageHandler.serialize(empty_response))
+                    continue
 
-        try:
-            zmq.proxy(self._frontend_sock, self._backend_sock)
+                # Handle the request
+                response_message = self._callback(message)
+                if not isinstance(response_message, self._response_class):
+                    print(
+                        f"Warning: Wrong message class, expect: {self._response_class.__name__}"
+                    )
+                    response_message = self._response_class()
 
-        except (zmq.ZMQError, zmq.ContextTerminated):
-            print(f"[{self._name}] Responder 已成功停止")
-        finally:
-            if not self._worker_stop_event.is_set():
-                self._worker_stop_event.set()
-                self._cleanup()
+                response_bytes = ProtobufMessageHandler.serialize(response_message)
+                self._socket.send(response_bytes)
 
-    def _cleanup(self):
+            except Exception as e:
+                print(f"[{self._name}] Callback execution error: {e}")
+
+            except zmq.ContextTerminated:
+                # 當 context 被關閉時，優雅退出
+                print(f"[{self._name}] Context terminated.")
+                break
+            except Exception as e:
+                # 捕捉其他非預期的 ZMQ 錯誤
+                print(f"[{self._name}] Unexpected error: {e}")
+                if self._stop_event.is_set():
+                    break
+
         self._heartbeat_client.stop()
-        self._frontend_sock.close(linger=0)
-        self._backend_sock.close(linger=0)
-        for p in self._workers:
-            p.join(timeout=5.0)
-            if p.is_alive():
-                print(f"Worker {p.pid} did not exit in time, terminating...")
-                p.terminate()
+        if self._socket:
+            self._socket.close(linger=0)
+
 
     def close(self):
-        self._worker_stop_event.set()
-        self._cleanup()
-        if self._routing_thread:
-            self._routing_thread.join()
+        self._stop_event.set()
+        if self._response_thread:
+            self._response_thread.join()
 
 
 class Publisher(ServiceCore):
