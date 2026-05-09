@@ -1,8 +1,7 @@
 import time
 
-from lemegeton.msg.common.std_msgs_pb2 import String
-
 import lemegeton
+from lemegeton.msg.common.std_msgs_pb2 import String
 
 context = lemegeton.Context()
 
@@ -10,14 +9,14 @@ context = lemegeton.Context()
 #####################################################################
 
 
-pub = lemegeton.server.Publisher(
-    context=context, name="test_pub", message_class=String, mode="tcp"
-)
-
-
-# pub = lemegeton.client.Publisher(
-#     context=context, name="test_pub", message_class=String, ip_address="localhost"
+# pub = lemegeton.server.Publisher(
+#     context=context, name="test_pub", message_class=String, mode="tcp"
 # )
+
+
+pub = lemegeton.client.Publisher(
+    context=context, name="test_pub", message_class=String, ip_address="localhost"
+)
 
 #####################################################################
 
