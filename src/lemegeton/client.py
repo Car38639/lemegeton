@@ -180,7 +180,7 @@ class Requester(ClientCore):
             self._connect()
             return None
 
-        elif self._endpoint != self._last_endpoint:
+        elif self._last_endpoint is not None and self._endpoint != self._last_endpoint:
             print(f"[{self._name}] endpoint has changed.")
             self._init_socket()
 
@@ -268,7 +268,7 @@ class Publisher(ClientCore):
             self._connect()
             return
 
-        elif self._endpoint != self._last_endpoint:
+        elif self._last_endpoint is not None and self._endpoint != self._last_endpoint:
             print(f"[{self._name}] endpoint has changed.")
             self._init_socket()
 
@@ -282,7 +282,8 @@ class Publisher(ClientCore):
         return self.status == ClientStatue.Connected
 
     def close(self):
-        self._socket.close()
+        if self._socket:
+            self._socket.close()
         super().close()
 
 
@@ -349,7 +350,10 @@ class Subscriber(ClientCore):
                     time.sleep(0.1)
                     continue
 
-                elif self._endpoint != self._last_endpoint:
+                elif (
+                    self._last_endpoint is not None
+                    and self._endpoint != self._last_endpoint
+                ):
                     print(f"[{self._name}] endpoint has changed.")
                     self._init_socket()
 

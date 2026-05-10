@@ -1,5 +1,6 @@
-import lemegeton
 from lemegeton.msg.common.std_msgs_pb2 import String
+
+import lemegeton
 
 
 def message_callback(msg):
@@ -15,7 +16,7 @@ sub = lemegeton.server.Subscriber(
     name="test_pub",
     message_class=String,
     callback=message_callback,
-    mode="ipc",  # 使用 TCP 模式
+    mode="tcp",  # 使用 TCP 模式
 )
 
 

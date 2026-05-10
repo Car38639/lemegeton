@@ -1,4 +1,3 @@
-import multiprocessing
 import socket
 import threading
 from typing import Literal, Optional
@@ -52,8 +51,6 @@ class ServiceCore:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("", 0))
             return s.getsockname()[1]
-
-
 
 
 class Responder(ServiceCore):
@@ -141,7 +138,6 @@ class Responder(ServiceCore):
         self._heartbeat_client.stop()
         if self._socket:
             self._socket.close(linger=0)
-
 
     def close(self):
         self._stop_event.set()
