@@ -394,20 +394,3 @@ class HeartbeatClient:
             print(f"[{self.name}] Unregister timeout. No response from Gateway.")
         self.registry_sock.close()
         self.heartbeat_sock.close()
-
-
-def query_service_info(
-    context, name, ip_address="localhost", port=Gateway.DEFAULT_QUERY_PORT, timeout=2000
-):
-    sock = context.socket(zmq.REQ)
-    sock.setsockopt(zmq.RCVTIMEO, timeout)
-    sock.setsockopt(zmq.LINGER, 0)
-    try:
-        sock.connect(f"tcp://{ip_address}:{port}")
-        sock.send_json({"name": name})
-        resp = sock.recv_json()
-    except zmq.Again:
-        resp = None
-    finally:
-        sock.close()
-    return resp

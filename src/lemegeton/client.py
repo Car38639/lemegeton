@@ -1,19 +1,14 @@
 import threading
 import time
-from enum import Enum, auto
 from typing import Optional
 
 import zmq
 
-from lemegeton.gateway import Gateway, GatewayStatus, ServiceType, query_service_info
+from lemegeton.gateway import Gateway, GatewayStatus, ServiceType
 from lemegeton.serializer import ProtobufMessageHandler
 
-
-class ClientStatue(Enum):
-    Connected = auto()
-    Disconnected = auto()
-    Querying = auto()
-    Standby = auto()
+CLIENT_HEARTBEAT_INTERVAL = 0.5  # seconds
+CLIENT_HEARTBEAT_TIMEOUT = 2.0  # seconds
 
 
 class ClientCore:
@@ -24,97 +19,88 @@ class ClientCore:
         expect_service_type: ServiceType,
         ip_address: str,
         query_port: int,
+        heartbeat_interval: float = CLIENT_HEARTBEAT_INTERVAL,
+        heartbeat_timeout: float = CLIENT_HEARTBEAT_TIMEOUT,
     ):
         self._context = context
         self._name = name
         self._expect_service_type = expect_service_type
         self._ip_address = ip_address
         self._query_port = query_port
+        self._heartbeat_interval = heartbeat_interval
 
-        self._query_envet = threading.Event()
-        self._error_event = threading.Event()
-        self._connect_event = threading.Event()
+        self._endpoint = None
+        self._reconnect_event = threading.Event()
+
+        self._heartbeat_sock = context.socket(zmq.REQ)
+        self._heartbeat_sock.setsockopt(zmq.RCVTIMEO, int(heartbeat_timeout * 1000))
+        self._heartbeat_sock.setsockopt(zmq.LINGER, 0)
+        self._heartbeat_sock.connect(f"tcp://{ip_address}:{self._query_port}")
+
         self._heartbeat_stop_event = threading.Event()
-        self._heartbeat_thread = None
-
-    def _connect(self):
-        self._connect_event.set()
-        if self._heartbeat_thread:
-            self._heartbeat_stop_event.set()
-            self._heartbeat_thread.join()
-            self._heartbeat_stop_event.clear()
-
-        self._query_envet.set()
         self._heartbeat_thread = threading.Thread(target=self._heartbeat, daemon=True)
         self._heartbeat_thread.start()
 
     def _heartbeat(self):
-        while not self._heartbeat_stop_event.is_set():
-            self._endpoint, self._query_endpoint_message = self._query_gateway()
-            if not self._endpoint:
-                self._error_event.set()
-            else:
-                self._error_event.clear()
-            self._query_envet.clear()
-            time.sleep(0.5)
-
-    @property
-    def status(self):
-        if self._query_envet.is_set():
-            return ClientStatue.Querying
-        elif self._error_event.is_set():
-            return ClientStatue.Disconnected
-        elif self._connect_event.is_set():
-            return ClientStatue.Standby
-        else:
-            return ClientStatue.Connected
-
-    def _query_gateway(self):
         def _get_endpoint(service_ip, service_info):
             if service_ip == "localhost":
-                if service_info["endpoint"]["ipc"] is not None:
+                if service_info.get("endpoint", {}).get("ipc") is not None:
                     return f"ipc://{service_info['endpoint']['ipc']}"
                 else:
                     return f"tcp://{service_ip}:{service_info['endpoint']['tcp']}"
             else:
-                if service_info["endpoint"]["tcp"] is not None:
+                if service_info.get("endpoint", {}).get("tcp") is not None:
                     return f"tcp://{service_ip}:{service_info['endpoint']['tcp']}"
                 else:
                     return None
 
-        info = query_service_info(
-            self._context,
-            self._name,
-            ip_address=self._ip_address,
-            port=self._query_port,
-            timeout=2000,
-        )
+        while not self._heartbeat_stop_event.is_set():
+            try:
+                self._heartbeat_sock.send_json({"name": self._name})
+                resp = self._heartbeat_sock.recv_json()
+                if resp is None or resp.get("status") != GatewayStatus.FOUND.value:
+                    # print(
+                    #     f"[{self._name}] Service not found or inaccessible! Please ensure the service is running and the name is correct."
+                    # )
+                    self._endpoint = None
+                    time.sleep(self._heartbeat_interval)
+                    continue
 
-        if info["status"] != GatewayStatus.FOUND.value:
-            return (
-                None,
-                "Service not found or inaccessible! Please ensure the service is running and the name is correct.",
-            )
+                elif (
+                    resp.get("data", {}).get("type") != self._expect_service_type.value
+                ):
+                    # print(
+                    #     f"[{self._name}] Service type mismatch! The service is {resp.get('data', {}).get('type')}, but expected {self._expect_service_type.value}."
+                    # )
+                    self._endpoint = None
+                    time.sleep(self._heartbeat_interval)
+                    continue
 
-        info_data = info.get("data")
+                else:
+                    endpoint = _get_endpoint(self._ip_address, resp.get("data", {}))
+                    if endpoint is None:
+                        # print(
+                        #     f"[{self._name}] Service is not accessible for external client."
+                        # )
+                        self._endpoint = None
 
-        if info_data["type"] != self._expect_service_type.value:
-            return (
-                None,
-                f"Service type mismatch! The service is {info_data['type']}, but expected {self._expect_service_type.value}.",
-            )
+                    elif endpoint != self._endpoint:
+                        # print(
+                        #     f"[{self._name}] Service endpoint changed: {self._endpoint} -> {endpoint}"
+                        # )
+                        self._reconnect_event.set()
+                        self._endpoint = endpoint
+                    time.sleep(self._heartbeat_interval)
 
-        endpoint = _get_endpoint(self._ip_address, info_data)
-        if endpoint is None:
-            return (
-                None,
-                "Service is not accessible for external client.",
-            )
-        else:
-            return (
-                endpoint,
-                "Service query success.",
-            )
+            except zmq.Again:
+                print("Gateway query timeout. Retrying...")
+            except zmq.ContextTerminated:
+                break
+            except Exception as e:
+                print(f"[{self._name}] Heartbeat error: {e}")
+                break
+
+        self._heartbeat_sock.close(linger=0)
 
     def close(self):
         self._heartbeat_stop_event.set()
@@ -132,6 +118,8 @@ class Requester(ClientCore):
         ip_address: str = "localhost",
         query_port: Optional[int] = Gateway.DEFAULT_QUERY_PORT,
         timeout: float = 3.0,
+        heartbeat_interval: float = CLIENT_HEARTBEAT_INTERVAL,
+        heartbeat_timeout: float = CLIENT_HEARTBEAT_TIMEOUT,
     ):
         super().__init__(
             context=context,
@@ -139,6 +127,8 @@ class Requester(ClientCore):
             expect_service_type=ServiceType.RESPONDER,
             ip_address=ip_address,
             query_port=query_port,
+            heartbeat_interval=heartbeat_interval,
+            heartbeat_timeout=heartbeat_timeout,
         )
 
         self._message_class = message_class
@@ -146,10 +136,6 @@ class Requester(ClientCore):
         self._timeout_ms = int(timeout * 1000.0)
 
         self._socket = None
-        self._last_endpoint = None
-        self._connect()
-        if self.status == ClientStatue.Standby:
-            self._init_socket()
 
     def _init_socket(self):
         """初始化或重置 Socket 狀態"""
@@ -163,28 +149,20 @@ class Requester(ClientCore):
         self._socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
         self._socket.setsockopt(zmq.LINGER, 0)
         self._socket.connect(self._endpoint)
-        self._last_endpoint = self._endpoint
-        self._connect_event.clear()
+        self._reconnect_event.clear()
 
     def send(self, message):
         if not isinstance(message, self._message_class):
             print(f"Warning: Expected {self._message_class.__name__}")
             return None
 
-        if self.status == ClientStatue.Querying:
-            print("Waiting for gateway responding......")
+        if self._endpoint is None:
+            print(
+                f"[{self._name}] No endpoint available. Please wait for the gateway to respond."
+            )
             return None
 
-        elif self.status == ClientStatue.Disconnected:
-            print(f"[{self._name}] {self._query_endpoint_message}")
-            self._connect()
-            return None
-
-        elif self._last_endpoint is not None and self._endpoint != self._last_endpoint:
-            print(f"[{self._name}] endpoint has changed.")
-            self._init_socket()
-
-        elif self.status == ClientStatue.Standby:
+        elif self._reconnect_event.is_set():
             self._init_socket()
 
         try:
@@ -207,7 +185,7 @@ class Requester(ClientCore):
             raise Exception(e)
 
     def is_connect(self):
-        return self.status == ClientStatue.Connected
+        return self._endpoint is not None and not self._reconnect_event.is_set()
 
     def close(self):
         if self._socket:
@@ -223,6 +201,8 @@ class Publisher(ClientCore):
         message_class,
         ip_address: str = "localhost",
         query_port: Optional[int] = Gateway.DEFAULT_QUERY_PORT,
+        heartbeat_interval: float = CLIENT_HEARTBEAT_INTERVAL,
+        heartbeat_timeout: float = CLIENT_HEARTBEAT_TIMEOUT,
     ):
         super().__init__(
             context=context,
@@ -230,27 +210,24 @@ class Publisher(ClientCore):
             expect_service_type=ServiceType.SUBSCRIBER,
             ip_address=ip_address,
             query_port=query_port,
+            heartbeat_interval=heartbeat_interval,
+            heartbeat_timeout=heartbeat_timeout,
         )
 
         self._message_class = message_class
 
         self._socket = None
-        self._last_endpoint = None
-        self._connect()
-        if self.status == ClientStatue.Standby:
-            self._init_socket()
-        # else:
-        #     print(f"[{self._name}] {self._query_endpoint_message}")
 
     def _init_socket(self):
         """初始化或重置 Socket 狀態"""
         if self._socket:
             self._socket.close(linger=0)
+
         self._socket = self._context.socket(zmq.PUB)
         self._socket.setsockopt(zmq.LINGER, 0)
         self._socket.connect(self._endpoint)
         self._last_endpoint = self._endpoint
-        self._connect_event.clear()
+        self._reconnect_event.clear()
 
     def send(self, message):
         if not isinstance(message, self._message_class):
@@ -259,27 +236,22 @@ class Publisher(ClientCore):
             )
             return
 
-        if self.status == ClientStatue.Querying:
-            print("Waiting for gateway responding......")
+        if self._endpoint is None:
+            print(
+                f"[{self._name}] No endpoint available. Please wait for the gateway to respond."
+            )
             return
-
-        elif self.status == ClientStatue.Disconnected:
-            print(f"[{self._name}] {self._query_endpoint_message}")
-            self._connect()
-            return
-
-        elif self._last_endpoint is not None and self._endpoint != self._last_endpoint:
-            print(f"[{self._name}] endpoint has changed.")
+        elif self._reconnect_event.is_set():
             self._init_socket()
 
-        elif self.status == ClientStatue.Standby:
-            self._init_socket()
-
-        message_bytes = ProtobufMessageHandler.serialize(message)
-        self._socket.send(message_bytes)
+        try:
+            message_bytes = ProtobufMessageHandler.serialize(message)
+            self._socket.send(message_bytes)
+        except Exception as e:
+            print(f"[{self._name}] Error sending message: {e}")
 
     def is_connect(self):
-        return self.status == ClientStatue.Connected
+        return self._endpoint is not None and not self._reconnect_event.is_set()
 
     def close(self):
         if self._socket:
@@ -298,6 +270,8 @@ class Subscriber(ClientCore):
         query_port: Optional[int] = Gateway.DEFAULT_QUERY_PORT,
         timeout: float = 60.0,
         buffer_size: int = 100,
+        heartbeat_interval: float = CLIENT_HEARTBEAT_INTERVAL,
+        heartbeat_timeout: float = CLIENT_HEARTBEAT_TIMEOUT,
     ):
         super().__init__(
             context=context,
@@ -305,6 +279,8 @@ class Subscriber(ClientCore):
             expect_service_type=ServiceType.PUBLISHER,
             ip_address=ip_address,
             query_port=query_port,
+            heartbeat_interval=heartbeat_interval,
+            heartbeat_timeout=heartbeat_timeout,
         )
         self._message_class = message_class
         self._callback = callback
@@ -314,13 +290,6 @@ class Subscriber(ClientCore):
         self._sub_thread = None
 
         self._socket = None
-        self._last_endpoint = None
-        self._connect()
-        if self.status == ClientStatue.Standby:
-            self._init_socket()
-        # else:
-        #     print(f"[{self._name}] {self._query_endpoint_message}")
-
         self._sub_thread = threading.Thread(target=self._subscribe_process, daemon=True)
         self._sub_thread.start()
 
@@ -333,31 +302,19 @@ class Subscriber(ClientCore):
         self._socket.setsockopt(zmq.RCVHWM, self._buffer_size)
         self._socket.setsockopt(zmq.LINGER, 0)  # 防止關閉時卡住
         self._socket.connect(self._endpoint)
-        self._last_endpoint = self._endpoint
         self._socket.setsockopt_string(zmq.SUBSCRIBE, "")
-        self._connect_event.clear()
+        self._reconnect_event.clear()
 
     def _subscribe_process(self):
         while not self._sub_stop_event.is_set():
             try:
-                if self.status == ClientStatue.Querying:
-                    print("Waiting for gateway responding......")
-                    time.sleep(0.1)
+                if self._endpoint is None:
+                    print(
+                        f"[{self._name}] No endpoint available. Waiting for the gateway to respond......"
+                    )
+                    time.sleep(0.5)
                     continue
-
-                elif self.status == ClientStatue.Disconnected:
-                    self._connect()
-                    time.sleep(0.1)
-                    continue
-
-                elif (
-                    self._last_endpoint is not None
-                    and self._endpoint != self._last_endpoint
-                ):
-                    print(f"[{self._name}] endpoint has changed.")
-                    self._init_socket()
-
-                elif self.status == ClientStatue.Standby:
+                elif self._reconnect_event.is_set():
                     self._init_socket()
 
                 # 2. 接收與反序列化
@@ -386,7 +343,7 @@ class Subscriber(ClientCore):
         super().close()
 
     def is_connect(self):
-        return self.status == ClientStatue.Connected
+        return self._endpoint is not None and not self._reconnect_event.is_set()
 
     def close(self):
         self._sub_stop_event.set()

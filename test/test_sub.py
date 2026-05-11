@@ -11,23 +11,23 @@ context = lemegeton.Context()
 
 #####################################################################
 
-sub = lemegeton.server.Subscriber(
-    context=context,
-    name="test_pub",
-    message_class=String,
-    callback=message_callback,
-    mode="tcp",  # 使用 TCP 模式
-)
-
-
-# sub = lemegeton.client.Subscriber(
+# sub = lemegeton.server.Subscriber(
 #     context=context,
 #     name="test_pub",
 #     message_class=String,
 #     callback=message_callback,
-#     ip_address="localhost",  # 指定服務所在的 IP 地址
-#     timeout=1.0,  # 設定查詢服務的超時時間 seconds
+#     mode="tcp",  # 使用 TCP 模式
 # )
+
+
+sub = lemegeton.client.Subscriber(
+    context=context,
+    name="test_pub",
+    message_class=String,
+    callback=message_callback,
+    ip_address="localhost",  # 指定服務所在的 IP 地址
+    timeout=1.0,  # 設定查詢服務的超時時間 seconds
+)
 
 #####################################################################
 
