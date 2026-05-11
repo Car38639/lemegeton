@@ -10,23 +10,23 @@ class ShmHost:
 
         Use double buffering with two shared memory segments (shm_0 and shm_1) and a control segment (shm_ctrl) to manage synchronization.
         """
-        self.data_shape = data_shape
-        data_size = np.prod(data_shape) * np.dtype(data_type).itemsize
+        self.data_shape = tuple(int(dim) for dim in data_shape)
+        data_size = np.prod(self.data_shape) * np.dtype(data_type).itemsize
         self.data_type = data_type
 
         self.shm0 = shared_memory.SharedMemory(create=True, size=data_size)
         self.shm0_buf = np.ndarray(
-            data_shape, dtype=self.data_type, buffer=self.shm0.buf
+            self.data_shape, dtype=self.data_type, buffer=self.shm0.buf
         )
 
         self.shm1 = shared_memory.SharedMemory(create=True, size=data_size)
         self.shm1_buf = np.ndarray(
-            data_shape, dtype=self.data_type, buffer=self.shm1.buf
+            self.data_shape, dtype=self.data_type, buffer=self.shm1.buf
         )
 
         self.shm2 = shared_memory.SharedMemory(create=True, size=data_size)
         self.shm2_buf = np.ndarray(
-            data_shape, dtype=self.data_type, buffer=self.shm2.buf
+            self.data_shape, dtype=self.data_type, buffer=self.shm2.buf
         )
 
         self.shm_ctrl = shared_memory.SharedMemory(create=True, size=1)
@@ -88,7 +88,7 @@ class ShmReader:
         """
         self.shm0, self.shm1, self.shm2, self.shm_ctrl = None, None, None, None
         try:
-            self.data_shape = shm_metadata["data_shape"]
+            self.data_shape = tuple(int(dim) for dim in shm_metadata["data_shape"])
             self.data_type = shm_metadata["data_type"]
 
             data_size = (
