@@ -269,7 +269,6 @@ class Subscriber(ClientCore):
         ip_address: str = "localhost",
         query_port: Optional[int] = Gateway.DEFAULT_QUERY_PORT,
         timeout: float = 60.0,
-        buffer_size: int = 100,
         heartbeat_interval: float = CLIENT_HEARTBEAT_INTERVAL,
         heartbeat_timeout: float = CLIENT_HEARTBEAT_TIMEOUT,
     ):
@@ -285,7 +284,6 @@ class Subscriber(ClientCore):
         self._message_class = message_class
         self._callback = callback
         self._timeout = int(timeout * 1000)  # 轉換為毫秒
-        self._buffer_size = buffer_size
         self._sub_stop_event = threading.Event()
         self._sub_thread = None
 
@@ -299,7 +297,7 @@ class Subscriber(ClientCore):
             self._socket.close(linger=0)
         self._socket = self._context.socket(zmq.SUB)
         self._socket.setsockopt(zmq.RCVTIMEO, self._timeout)
-        self._socket.setsockopt(zmq.RCVHWM, self._buffer_size)
+        self._socket.setsockopt(zmq.CONFLATE, 1)
         self._socket.setsockopt(zmq.LINGER, 0)  # 防止關閉時卡住
         self._socket.connect(self._endpoint)
         self._socket.setsockopt_string(zmq.SUBSCRIBE, "")

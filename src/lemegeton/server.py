@@ -207,7 +207,6 @@ class Subscriber(ServiceCore):
         callback,
         mode: Literal["tcp", "ipc", "both"] = "tcp",
         port: Optional[int] = None,
-        buffer_size: int = 100,
     ):
         try:
             super().__init__(context, name, ServiceType.SUBSCRIBER, port, mode)
@@ -220,7 +219,7 @@ class Subscriber(ServiceCore):
 
         self._socket = context.socket(zmq.SUB)
         self._socket.setsockopt(zmq.LINGER, 0)
-        self._socket.setsockopt(zmq.RCVHWM, buffer_size)
+        self._socket.setsockopt(zmq.CONFLATE, 1)
 
         if self._enable_tcp:
             try:
