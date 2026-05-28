@@ -18,4 +18,5 @@ message State {
   StateMessage limb = 2;
   StateMessage left_hand = 3;
   StateMessage right_hand = 4;
+  bool can_accept_control = 5;
 }

@@ -34,6 +34,7 @@ class ServiceType(Enum):
     RESPONDER = "res"
     PUSHER = "push"
     PULLER = "pull"
+    ACTION = "action"
 
 
 class RegistryAction(Enum):
