@@ -96,3 +96,7 @@ message RobotControl {
   }
 
 }
+
+message RobotControlSequence {
+  repeated RobotControl sequence = 1;
+}
