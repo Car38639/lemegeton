@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package humanoid.kinematic;
+
+import "lemegeton/msg/common/manipulator.proto";
+import "lemegeton/msg/common/geometry.proto";
+
+// Forward kinematics: joint state in -> end-effector pose out.
+message ForwardRequest {
+  lemegeton.msg.common.manipulator.JointState joint_state = 1;
+}
+
+message ForwardRespond {
+  lemegeton.msg.common.geometry.Pose pose = 1;
+  bool success = 2;
+}
+
+// Inverse kinematics: target pose in -> joint state out.
+message InverseRequest {
+  lemegeton.msg.common.geometry.Pose pose = 1;
+}
+
+message InverseRespond {
+  lemegeton.msg.common.manipulator.JointState joint_state = 1;
+  bool success = 2;
+}
