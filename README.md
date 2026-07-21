@@ -1,93 +1,144 @@
-# protocol
+# lemegeton
 
+人形機器人（humanoid robot）用的輕量分散式通訊中介函式庫（middleware / SDK）。
+建立在 **ZeroMQ + Protobuf + Redis** 之上，提供類似 ROS 的通訊模式與服務發現，
+讓機器人上各模組（手臂、腰部、移動、手掌、遙操作、感測器…）能以名稱互相溝通，
+無需寫死 IP/port。
 
+## 特色
 
-## Getting started
+- **服務發現 Gateway**：類似 ROS Master / DNS，服務以名稱註冊、心跳維持存活，
+  client 以名稱查詢對方位址；狀態同步到 Redis 以支援跨節點共享與過期清理。
+- **三種通訊模式**：
+  - Pub / Sub —— 一對多廣播（狀態串流等）
+  - Req / Res —— 一問一答（含超時、自動重連）
+  - Action —— 仿 ROS Action 的長任務（goal / feedback / result、可取消）
+- **共享記憶體**：三重緩衝（triple buffering）無鎖切換，適合影像等高頻大資料。
+- **Protobuf 訊息**：以 `lemegeton/msg/` 為單一來源，附帶仿 ROS 的編譯 CLI。
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## 安裝
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+```bash
+# 一般安裝（含 protobuf 編譯工具）
+pip install ".[build]"
+```
 
-## Add your files
+安裝後會提供兩個指令：`lemegeton`（專案工具）與 `compile_protos`
+（等同 `lemegeton compile`，向後相容）。
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+> `[build]` extra 會安裝 `grpcio-tools`（內建 protoc 與 `google/protobuf/*`
+> well-known types），因此不需要另外手動安裝系統的 `protoc`。
+
+## 訊息（Protobuf）
+
+所有 `.proto` 都放在 **`src/lemegeton/msg/`** 底下，以第一層資料夾當作一個
+「訊息 group」：
 
 ```
-cd existing_repo
-git remote add origin http://gitlab.dev.solomon-3d.com/ros-team/solhumanoid/sdk/common/protocol.git
-git branch -M main
-git push -uf origin main
+src/lemegeton/msg/
+├── common/     # geometry、manipulator、std_msgs
+├── humanoid/   # connection、robot_control、state、kinematic
+├── teleop/     # teleop、remote_control
+├── sensor/     # image
+└── template/   # template（範本）
 ```
 
-## Integrate with your tools
+### import 慣例
 
-- [ ] [Set up project integrations](http://gitlab.dev.solomon-3d.com/ros-team/solhumanoid/sdk/common/protocol/-/settings/integrations)
+編譯後可直接以套件路徑 import：
 
-## Collaborate with your team
+```python
+from lemegeton.msg.humanoid import robot_control_pb2 as rc
+from lemegeton.msg.common import geometry_pb2 as geo
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+msg = rc.RobotControl(robot_type="humanoid-01")
+```
 
-## Test and Deploy
+> 關鍵：protoc 生成的 Python import 路徑由 `.proto` **相對於 include root 的路徑**
+> 決定。本工具固定把 include root 設在套件的上一層，並要求 `.proto` 內的 import
+> 以完整路徑書寫（例如 `import "lemegeton/msg/common/geometry.proto";`），
+> 因此生成的 `_pb2.py` 內部一律是 `from lemegeton.msg... import ..._pb2`。
 
-Use the built-in continuous integration in GitLab.
+## CLI 用法
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+`lemegeton` CLI 一律作用於**當前所在的專案**（從當前目錄往上爬尋找
+`pyproject.toml` / `CMakeLists.txt`），與工具安裝位置無關。
 
-***
+### `lemegeton create` — 建立 msg/ 骨架
 
-# Editing this README
+在專案的 package 內建立 `msg/__init__.py` 與 `msg/template/template.proto`：
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+```bash
+cd /path/to/your_project
+lemegeton create
+```
 
-## Suggestions for a good README
+### `lemegeton compile` — 編譯 protobuf
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+```bash
+lemegeton compile                 # 編譯當前專案 msg/ 下全部 .proto
+lemegeton compile -p humanoid     # 只編某個 group
+lemegeton compile --proto humanoid/state.proto   # 只編單一檔案
+lemegeton compile --list          # 列出發現的 group / proto
+lemegeton compile --clean         # 移除生成的 *_pb2.py
+lemegeton compile --pkg-dir /other/pkg   # 明確指定其它套件目錄（跨專案）
+```
 
-## Name
-Choose a self-explaining name for your project.
+典型流程：
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+```bash
+lemegeton create
+lemegeton compile --clean && lemegeton compile
+```
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+> 這套 CLI 是 package-agnostic 的：對任意 `mypkg/msg/**/*.proto`，
+> 編譯後皆可 `import mypkg.msg.<group>.<name>_pb2`。
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+## 快速範例
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+```python
+import zmq
+from lemegeton import Context
+from lemegeton.client import Publisher, Subscriber
+from lemegeton.msg.humanoid import state_pb2
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+ctx = Context()
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+# 發布端
+pub = Publisher(ctx, name="robot_state", message_class=state_pb2.State)
+pub.send(state_pb2.State(...))
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+# 訂閱端
+def on_msg(msg): print(msg)
+sub = Subscriber(ctx, name="robot_state", message_class=state_pb2.State, callback=on_msg)
+```
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+更多用法可參考 [test/](test/) 底下的範例（`test_pub`、`test_req`、
+`test_action_client/server`、`test_gateway` 等）。
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+## 部署 Gateway
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+以 Docker Compose 啟動 Redis 與 Gateway：
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+```bash
+cd deploy
+docker compose up -d
+```
 
-## License
-For open source projects, say how it is licensed.
+Gateway 進入點為 [deploy/main.py](deploy/main.py)，預設查詢埠 `60001`。
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+## 專案結構
+
+```
+src/lemegeton/
+├── gateway.py         # 服務發現 Gateway + 心跳 client
+├── client.py          # Requester / Publisher / Subscriber / ActionClient
+├── server.py          # Responder / Publisher / Subscriber / ActionServer
+├── serializer.py      # Protobuf 序列化
+├── shm_util.py         # 共享記憶體（三重緩衝）
+├── project.py         # 專案偵測（walk-up）
+├── create.py          # `lemegeton create`
+├── compile_protos.py  # `lemegeton compile`（ProtoCompiler）
+├── cli.py             # 統一 CLI 進入點
+└── msg/               # protobuf 訊息（單一來源）
+```

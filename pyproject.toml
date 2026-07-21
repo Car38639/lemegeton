@@ -14,8 +14,13 @@ authors = [
 # 專案運行所需的第三方套件
 dependencies = ["protobuf", "pyzmq", "redis"]
 
+[project.optional-dependencies]
+# protobuf 編譯工具 (內建 protoc 與 google/protobuf well-known types)
+build = ["grpcio-tools"]
+
 [project.scripts]
-compile_protos = "lemegeton.compile_protos:run_bash"
+lemegeton = "lemegeton.cli:main"
+compile_protos = "lemegeton.compile_protos:main"  # 向後相容 (等同 lemegeton compile)
 
 [tool.setuptools]
 package-dir = { "" = "src"}
