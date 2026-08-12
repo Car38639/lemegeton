@@ -52,6 +52,11 @@ class ServiceCore:
             s.bind(("", 0))
             return s.getsockname()[1]
 
+    @property
+    def name_conflict(self) -> bool:
+        """名稱是否已被其他實例佔走。為 True 時本服務已停止心跳、不再能被查詢到。"""
+        return getattr(self._heartbeat_client, "name_conflict", False)
+
 
 class Responder(ServiceCore):
     def __init__(

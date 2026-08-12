@@ -5,8 +5,8 @@
 
 | 分類 | 數量 | 已修正 |
 | --- | --- | --- |
-| P0 正確性錯誤 | 10 | 9 |
-| P1 穩健性 / 資源管理 | 19 | 2 |
+| P0 正確性錯誤 | 10 | 10 |
+| P1 穩健性 / 資源管理 | 19 | 3 |
 | P2 專案 / 建置 / 工具 | 10 | 0 |
 | 安全性與部署風險 | 7 | 0 |
 | 部署與版本落差 | 2 | 2 |
@@ -66,8 +66,9 @@
   **已修正**：新增 `_dealer_lock`（RLock），`send_goal` / `cancel_goal` / listener 的 poll+recv 全部序列化；listener 改用 20ms 短 poll 並在鎖外讓出，避免餓死送出端。DEALER 也改為由 `_ensure_dealer()` 延遲建立/重建，endpoint 未就緒時 `send_goal` 拋 `ConnectionError` 而不是操作 `None`。
   順帶修掉一個潛在死鎖：`future.set_result()` 原本在 `goals_lock` 內呼叫，而它會同步觸發使用者的 `result_callback`，callback 裡若再 `send_goal` 就會卡死；現改為在鎖外設值。
 
-- [ ] ⚠️ **心跳的名稱衝突偵測失效（狀態碼對不上）**
-  Gateway 心跳回應的是 `MISMATCH`（[gateway.py:184-213](src/lemegeton/gateway.py#L184-L213)），但 `HeartbeatClient` 只檢查 `ALREADY_EXISTS`（[gateway.py:353](src/lemegeton/gateway.py#L353)）。結果：同名服務被搶註後仍持續心跳、不會自我停止，兩個服務互相覆寫註冊資訊。
+- [x] ✅ ⚠️ **心跳的名稱衝突偵測失效（狀態碼對不上）**
+  Gateway 心跳回應的是 `MISMATCH`（[gateway.py:184-213](src/lemegeton/gateway.py#L184-L213)），但 `HeartbeatClient` 只檢查 `ALREADY_EXISTS`。結果：同名服務被搶註後仍持續心跳、不會自我停止，兩個服務互相覆寫註冊資訊（實測舊版：冒名者心跳線程持續存活）。
+  **已修正**：改為同時接受 `MISMATCH` 與 `ALREADY_EXISTS`（前者是心跳路徑、後者是註冊路徑，語意都是「這個名稱不屬於我」）。偵測到之後停止心跳、設定 `HeartbeatClient.name_conflict`，並印出明確警告（原本那行 print 是被註解掉的，就算偵測成功也沒人會知道）。服務端可透過 `ServiceCore.name_conflict` 查詢自己是否已被搶名。
 
 - [x] ✅ ⚠️ **Action feedback 閒置超時會讓整個 ActionClient 失效**
   [client.py:463-482](src/lemegeton/client.py#L463-L482)、[client.py:635-639](src/lemegeton/client.py#L635-L639)
@@ -96,9 +97,13 @@
 - [ ] **Gateway 是單執行緒 + 阻塞式 REP**
   任一分支（含 Redis I/O）阻塞就會拖住註冊、心跳與查詢；REP 模式下若某個 client 送了請求卻不收回應，該 socket 亦會卡在 send 狀態。
 
-- [ ] **服務崩潰後 20 秒內無法以同名重啟（repo 尚未修，但部署映像已修）**
-  [gateway.py:120-142](src/lemegeton/gateway.py#L120-L142) + [server.py:45-48](src/lemegeton/server.py#L45-L48)：舊紀錄要等 TTL（2 × 10 秒）過期才會清掉，期間新程序註冊被回 `ALREADY_EXISTS`，`ServiceCore` 直接 `raise` → 服務起不來。
-  **注意**：執行中的 `lemegeton-gateway` 映像**已經有修**（`last_seen` 超過 TTL 就允許新身份接管；`HeartbeatClient` 註冊失敗會重試到 TTL+5 秒才放棄），但這段程式碼從未進版控。**待辦是把映像裡的修改回填進 repo**，不是重新實作。
+- [x] ✅ **服務崩潰後 20 秒內無法以同名重啟**
+  [gateway.py](src/lemegeton/gateway.py) + [server.py:45-48](src/lemegeton/server.py#L45-L48)：舊紀錄要等 TTL（2 × 10 秒）過期才會清掉，期間新程序註冊被回 `ALREADY_EXISTS`，`ServiceCore` 直接 `raise` → 服務起不來。
+  **分兩階段修正**：
+  1. TTL 接管 + 註冊重試（原本只存在於部署映像，已回填進版控）：`last_seen` 超過 TTL 的舊條目允許新 `service_id` 接管，`HeartbeatClient` 註冊失敗重試至 TTL+5 秒才放棄。**但實測仍要等 18.0 秒**（TTL 20 秒扣掉最後一次心跳的時間差），而重試上限是 25 秒，只剩 7 秒餘裕。
+  2. 主動存活探測（本次）：新增 `Gateway._owner_is_alive()`，試著去綁舊註冊的端點 —— 綁得起來代表沒人在監聽、行程已死，可**立刻**接管，不必等滿 TTL。純 gateway 端改動，不動通訊協定，對舊版 client 完全相容（相對之下，調快心跳頻率會讓還沒升級的服務被誤判過期）。
+  服務是「先註冊、後 bind」，剛註冊完的瞬間端點還沒綁上，因此加了 `PROBE_GRACE = 3.0` 秒緩衝，避免把正在啟動的服務誤判為已死；同一個 `service_id` 重送註冊則完全不觸發探測。
+  **部署版實測：接管耗時 18.0s → 0.0s**，且服務還活著時同名註冊仍被正確拒絕（`ALREADY_EXISTS`）。
 
 - [ ] **Action 的最後一筆 feedback 會被 RESULT 搶先而遺失**（端到端實測發現）
   [client.py:651-663](src/lemegeton/client.py#L651-L663)
@@ -243,6 +248,12 @@
 | T3 `docker restart lemegeton-gateway` | 心跳線程死亡，服務換 port 後永遠追不上 | ✅ 心跳/接收線程全存活；停機期間既有 PUB/SUB 不受影響；服務換 port 後 Requester `43961→44179`、Subscriber `42381→48067`，13.1s 內全部恢復 |
 | T4 gateway 不可達（query_port 指向空埠） | 2 秒後 `Heartbeat error: Operation cannot be accomplished in current state`，線程終止 | ✅ 持續重試，6 秒觀察期間線程恆存活 |
 | T5 ActionServer `mode="ipc"` / `"both"` | 兩種模式都失敗：client 解析到 ipc endpoint，`send_goal` 不報錯但結果永不回來（`TimeoutError`） | ✅ 兩種模式皆 `SUCCEEDED`，feedback 也經 ipc 正常送達 |
+| T6 同名衝突（service_id 不同的實例對真實 gateway 心跳） | gateway 確實回 `MISMATCH`，但冒名者 6 秒後心跳線程仍存活，持續覆寫他人註冊 | ✅ 立即偵測、印出警告、`name_conflict=True`、線程自行結束 |
+| T7 存活探測單元測試（真實 zmq socket，9 種情境 + 3 種註冊分支） | — | ✅ 12/12：端點被佔用→活著、端點已關→已死、未過 grace 不探測、活著時不可接管、超過 TTL 可接管 |
+| T8 `kill -9` 後同名重啟（部署版） | 重試 9 次、**18.0s** 才接管，離 25s 上限只剩 7s | ✅ **0.0s** 立即接管；服務仍活著時同名註冊照樣被拒 |
+
+> 上表「修正後」欄位自 T5 起皆為重建映像後的**部署版本**實測（未掛 `PYTHONPATH`）。
+> T1、T2 已於同一版本複測通過，確認 gateway 註冊路徑的改動沒有造成回歸。
 
 > 同名重啟要等 **18 秒**才成功（重試上限 `2 × HEARTBEAT_RATE + 5 = 25` 秒），對需要快速重啟的服務
 > 偏長且離上限不遠。可考慮縮短 TTL 或提高心跳頻率，見上方 P1「服務崩潰後 20 秒內無法以同名重啟」。
