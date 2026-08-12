@@ -7,7 +7,9 @@ from typing import Any, Dict, Optional
 import zmq
 
 from lemegeton.gateway import Gateway, GatewayStatus, ServiceType
-from lemegeton.serializer import ProtobufMessageHandler
+from lemegeton import blob
+from lemegeton.serializer import ProtobufMessageHandler, decode_payload
+from lemegeton.staging import to_message, to_payload
 
 CLIENT_HEARTBEAT_INTERVAL = 0.5  # seconds
 CLIENT_HEARTBEAT_TIMEOUT = 1.0  # seconds
@@ -188,6 +190,7 @@ class Requester(ClientCore):
         return True
 
     def send(self, message):
+        message = to_message(message)
         if not isinstance(message, self._message_class):
             print(f"Warning: Expected {self._message_class.__name__}")
             return None
@@ -267,7 +270,11 @@ class Publisher(ClientCore):
         self._reconnect_event.clear()
         return True
 
-    def send(self, message):
+    def send(self, message, arrays=None):
+        """送出訊息。`arrays` 的用法與 :meth:`lemegeton.server.Publisher.send` 相同。"""
+        message, staged = to_payload(message)
+        if arrays:
+            staged = {**staged, **arrays}
         if not isinstance(message, self._message_class):
             print(
                 f"[{self._name}] Warning: Wrong message class, expect: {self._message_class.__name__}"
@@ -282,8 +289,10 @@ class Publisher(ClientCore):
                 return
 
         try:
-            message_bytes = ProtobufMessageHandler.serialize(message)
-            self._socket.send(message_bytes)
+            if staged:
+                self._socket.send(blob.encode(message, staged), copy=False)
+            else:
+                self._socket.send(ProtobufMessageHandler.serialize(message))
         except Exception as e:
             print(f"[{self._name}] Error sending message: {e}")
 
@@ -307,6 +316,7 @@ class Subscriber(ClientCore):
         query_port: Optional[int] = Gateway.DEFAULT_QUERY_PORT,
         timeout: float = 30.0,
         connect_timeout: float = 5.0,
+        unpack_blobs: bool = False,
         heartbeat_interval: float = CLIENT_HEARTBEAT_INTERVAL,
         heartbeat_timeout: float = CLIENT_HEARTBEAT_TIMEOUT,
     ):
@@ -321,6 +331,8 @@ class Subscriber(ClientCore):
         )
         self._message_class = message_class
         self._callback = callback
+        # True 時 callback 簽章為 (message, arrays)
+        self._unpack_blobs = unpack_blobs
         self._timeout = int(timeout * 1000)  # 轉換為毫秒
         self._sub_stop_event = threading.Event()
         self._sub_thread = None
@@ -370,8 +382,8 @@ class Subscriber(ClientCore):
 
                 # 2. 接收與反序列化
                 message_bytes = self._socket.recv()
-                message = ProtobufMessageHandler.deserialize(
-                    self._message_class, message_bytes
+                args = decode_payload(
+                    message_bytes, self._message_class, self._unpack_blobs
                 )
             except zmq.Again:
                 continue
@@ -384,7 +396,7 @@ class Subscriber(ClientCore):
                 continue
 
             try:
-                self._callback(message)
+                self._callback(*args)
             except Exception as e:
                 print(f"[{self._name}] Callback execution error: {e}")
 
@@ -668,6 +680,7 @@ class ActionClient(ClientCore):
         :return: (goal_id, Future 物件)
         """
 
+        goal = to_message(goal)
         if not isinstance(goal, self._goal_class):
             print(
                 f"[{self._name} Client] Warning: Wrong goal class, expect: {self._goal_class.__name__}"

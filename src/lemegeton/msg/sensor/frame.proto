@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package lemegeton.msg.sensor.frame;
+
+import "google/protobuf/timestamp.proto";
+import "lemegeton/msg/common/blob.proto";
+
+// 相機的一幀。影像資料宣告成 Blob，框架會依大小自動決定內嵌或搬出訊息體。
+// 與 sensor.image.Image 的差別：Image 的 bytes 一律走 protobuf 序列化，
+// 大影像會有多次數 MB 的複製。
+message CameraFrame {
+  google.protobuf.Timestamp timestamp = 1;
+  string camera_id = 2;
+  string encoding = 3;                          // "bgr8" / "jpeg" ...
+  lemegeton.msg.common.blob.Blob image = 4;
+  lemegeton.msg.common.blob.Blob depth = 5;     // 可選；沒設就不會被送出
+}
+
+// 一組 pose 的陣列表示。
+// 列的意義由 joints 定義（長度須等於 data.shape[0]），
+// 行固定為 [px, py, pz, qx, qy, qz, qw]。
+message PoseArray {
+  repeated string joints = 1;
+  lemegeton.msg.common.blob.Blob data = 2;      // (N, 7) float64
+}

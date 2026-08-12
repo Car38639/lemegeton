@@ -13,7 +13,7 @@
 - **TCP / IPC 雙模式**：同機通訊走 abstract IPC socket（低延遲），跨機走 TCP，可設定 `mode="both"` 同時開啟。
 - **Protobuf 型別檢查**：收送訊息時檢查 message class，型別不符會警告而不會讓程序崩潰。
 - **Action 模式**：支援非同步目標（goal）、進度回報（feedback）、取消（cancel）與 `Future` 結果回收。
-- **共享記憶體工具**：`shm_util` 提供三緩衝（triple buffer）的大資料（如影像）零複製傳遞。
+- **大型資料傳輸**：影像、點雲等宣告成 `Blob` 欄位，框架依大小自動決定內嵌或搬到訊息體外（1080p 實測快 12 倍）。
 
 ---
 
@@ -25,8 +25,7 @@
 pip install .
 ```
 
-相依套件：`protobuf`、`pyzmq`。
-（`shm_util` 另外需要 `numpy`，目前未列入 `dependencies`，使用前請自行安裝。）
+相依套件：`protobuf`、`pyzmq`、`numpy`。
 
 ---
 
@@ -212,10 +211,14 @@ Action 線路協定（多幀訊息）：
 | --- | --- |
 | Client → Server（目標） | `[b"", b"GOAL", goal_id, payload]` |
 | Client → Server（取消） | `[b"", b"CANCEL", goal_id]` |
-| Server → Client（結果） | `[routing_id, b"", b"RESULT", goal_id, status, payload]` |
-| Server → Client（進度，PUB） | `[goal_id, feedback_payload]` |
+| Server → Client（結果） | `[routing_id, b"", b"RESULT", goal_id, status, payload, feedback 總筆數]` |
+| Server → Client（進度，PUB） | `[goal_id, feedback_payload, 流水號]` |
 
 `status` 為 `SUCCEEDED` / `FAILED` / `CANCELED`。
+
+末尾的流水號與總筆數讓 Client 在完成 `Future` 之前先等 feedback 收齊 —— RESULT 走
+DEALER、feedback 走 SUB 是兩條獨立通道，否則最後幾筆進度會被 RESULT 搶先而遺失。
+新欄位都附加在尾端，與舊版混用時仍可正常運作。
 
 ---
 
@@ -253,24 +256,6 @@ import "lemegeton/msg/common/geometry.proto";
 ```
 
 `src/lemegeton/msg/gen_pb2.sh` 則是用來重新產生**套件內建**訊息的腳本（在 `src/lemegeton/msg/` 下執行 `./gen_pb2.sh -p common/geometry.proto`）。
-
----
-
-## 共享記憶體（shm_util）
-
-適合傳遞影像等大型資料：`ShmHost` 建立三塊資料緩衝 + 1 byte 控制區，寫入 back buffer 後才切換控制索引；`ShmReader` 依控制索引讀取當前有效緩衝。
-
-```python
-from lemegeton.shm_util import ShmHost, ShmReader
-
-host = ShmHost(data_shape=(480, 640, 3), data_type=np.uint8)
-meta = host.get_metadata()      # 透過 Protobuf / Gateway 傳給其他行程
-
-reader = ShmReader(meta)        # 另一個行程
-frame = reader.get_data()
-```
-
-`ShmHost.release()` 會 unlink 共享記憶體；`ShmReader` 預設以 consumer 身分向 `resource_tracker` 取消註冊，避免行程結束時誤刪。
 
 ---
 
@@ -323,7 +308,8 @@ docker exec -it test_container bash
 │   ├── server.py            # Publisher / Subscriber / Responder / ActionServer（bind 端）
 │   ├── client.py            # Publisher / Subscriber / Requester / ActionClient（connect 端）
 │   ├── serializer.py        # Protobuf 序列化封裝
-│   ├── shm_util.py          # 共享記憶體三緩衝
+│   ├── blob.py              # 大型數值資料：內嵌或搬出訊息體
+│   ├── staging.py           # 事後指派的語法糖（lemegeton.build）
 │   ├── compile_protos.{py,sh}
 │   └── msg/                 # 內建 .proto 與已編譯的 _pb2.py
 └── test/                    # 手動示範腳本

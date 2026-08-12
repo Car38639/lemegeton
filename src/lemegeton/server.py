@@ -5,7 +5,9 @@ from typing import Any, Literal, Optional, Protocol, Tuple
 import zmq
 
 from lemegeton.gateway import HeartbeatClient, ServiceType
-from lemegeton.serializer import ProtobufMessageHandler
+from lemegeton import blob
+from lemegeton.serializer import ProtobufMessageHandler, decode_payload
+from lemegeton.staging import to_payload
 
 
 class ServiceCore:
@@ -198,14 +200,25 @@ class Publisher(ServiceCore):
         if self._enable_ipc:
             self._socket.bind(f"ipc://{self._ipc_path}")
 
-    def send(self, message):
+    def send(self, message, arrays=None):
+        """送出訊息。
+
+        :param arrays: 選填。``{Blob 欄位路徑: ndarray}``。使用 ``lemegeton.build()``
+                       時直接指派給 Blob 欄位即可，不必再傳這個參數。小的陣列會內嵌
+                       進訊息，大的自動搬到訊息體外（見 :mod:`lemegeton.blob`）。
+        """
+        message, staged = to_payload(message)
+        if arrays:
+            staged = {**staged, **arrays}
         if not isinstance(message, self._message_class):
             print(
                 f"[{self._name}] Warning: Wrong message class, expect: {self._message_class.__name__}"
             )
             return
-        message_bytes = ProtobufMessageHandler.serialize(message)
-        self._socket.send(message_bytes)
+        if staged:
+            self._socket.send(blob.encode(message, staged), copy=False)
+        else:
+            self._socket.send(ProtobufMessageHandler.serialize(message))
 
     def send_multipart(self, message_parts):
         self._socket.send_multipart(message_parts)
@@ -229,6 +242,7 @@ class Subscriber(ServiceCore):
         callback,
         mode: Literal["tcp", "ipc", "both"] = "tcp",
         port: Optional[int] = None,
+        unpack_blobs: bool = False,
     ):
         try:
             super().__init__(context, name, ServiceType.SUBSCRIBER, port, mode)
@@ -238,6 +252,8 @@ class Subscriber(ServiceCore):
 
         self._message_class = message_class
         self._callback = callback
+        # True 時 callback 簽章為 (message, arrays)
+        self._unpack_blobs = unpack_blobs
 
         self._socket = context.socket(zmq.SUB)
         self._socket.setsockopt(zmq.LINGER, 0)
@@ -267,8 +283,8 @@ class Subscriber(ServiceCore):
 
                 message_bytes = self._socket.recv()
                 try:
-                    message = ProtobufMessageHandler.deserialize(
-                        self._message_class, message_bytes
+                    args = decode_payload(
+                        message_bytes, self._message_class, self._unpack_blobs
                     )
                 except Exception:
                     print(
@@ -276,7 +292,7 @@ class Subscriber(ServiceCore):
                     )
                     continue
                 try:
-                    self._callback(message)
+                    self._callback(*args)
                 except Exception as e:
                     print(f"[{self._name}] Callback execution error: {e}")
 

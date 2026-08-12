@@ -6,7 +6,7 @@
 | 分類 | 數量 | 已修正 |
 | --- | --- | --- |
 | P0 正確性錯誤 | 10 | 10 |
-| P1 穩健性 / 資源管理 | 21 | 7 |
+| P1 穩健性 / 資源管理 | 19 | 8 |
 | P2 專案 / 建置 / 工具 | 11 | 0 |
 | 安全性與部署風險 | 7 | 1 |
 | 部署與版本落差 | 2 | 2 |
@@ -149,30 +149,43 @@
 - [ ] **`client.Publisher.send` / `Requester.send` 無鎖**
   多執行緒呼叫同一個 client 物件即為未定義行為；`Requester` 另有「`send` 與心跳線程同時觸發 `_init_socket`」的競爭（[client.py:142-154](src/lemegeton/client.py#L142-L154)）。
 
-- [ ] ⭐ **導入 blob 大型 payload 傳遞，並移除 `shm_util`** —— 設計與完整測試報告見 [docs/blob-vs-shm.md](docs/blob-vs-shm.md)
+- [x] ✅ ⭐ **導入 blob 大型 payload 傳遞**（0.6.0）
   影像走 protobuf 的 `bytes` 欄位，會產生三次數 MB 的配置與複製（1080p 端到端 4.24ms、4K 22.37ms）。改成「protobuf 只放 header，像素接在同一個 frame 尾端」後，1080p 降到 0.93ms、巢狀情境實測快 3.8 倍，且 schema 完全保留、`CONFLATE` 不用動。
-  **同時證實 `shm_util` 已無存在價值**：把 protobuf 的 bytes 包裝拿掉後，ZMQ ipc 與共享記憶體在 4K 只差 0.03ms、1080p 差 0.19ms（原因是現有 shm 實作並非零複製，本身就有兩次 `np.copyto`）。
+  同時量測了共享記憶體：把 protobuf 的 bytes 包裝拿掉後，單段 zero-copy 與 shm 在 4K 只差 0.03ms、1080p 差 0.19ms（現有 shm 實作並非零複製，本身就有兩次 `np.copyto`）。以框架實際的 blob 實作跨行程複測則是 1080p +1.12ms、4K +2.74ms，詳見下方移除紀錄。
   待辦步驟：
   1. 實作 `msg/common/blob.proto` + `blob.py`（`pack`/`unpack`/`is_blob`）
   2. `Publisher.send(message, blobs=None)`、`Subscriber(unpack_blobs=False)`、`serializer.decode_payload()`
-  3. `pyproject.toml` 新增 optional extra `array = ["numpy"]`
+  3. ~~`pyproject.toml` 加入 `numpy` 相依~~ ✅ 已完成
   4. 影像發布端改用 blob，量測實際相機解析度與幀率確認夠用
-  5. 移除 `shm_util` 與 README 相關段落，並連帶關閉下方三個 shm 項目
-  6. README 補上「`CONFLATE` 與 multipart 不相容」的注意事項
+  5. ~~移除 `shm_util`~~ ✅ 已完成（下游 `sensor_service` 由使用者後續更新，見下方移除紀錄）
+  6. README 補上「`CONFLATE` 與 multipart 不相容」的注意事項（未完成）
+  7. README 補上 `lemegeton.build()` 與 blob 的使用說明（未完成）
 
 - [ ] ⚠️ **`CONFLATE` 與 multipart 不相容，會靜默破壞資料**（實測確認）
   `CONFLATE=1` 把每個 frame 當成獨立訊息各自 conflate，multipart 的分組被摧毀 —— 送 20 則各 3 frame 的訊息，收端只拿到 **1 則、且只有最後一個 frame**。
   **現有的地雷**：`ActionServer` 的 feedback publisher 送的是 multipart，且以 `{name}_feedback` 正常註冊到 gateway。`ActionFeedbackSubscriber` 沒開 CONFLATE 所以沒事，但使用者若拿一般的 `client.Subscriber` 去訂閱那個名稱（完全合法，因為它就註冊在那裡），由於 `client.Subscriber` 寫死 `CONFLATE=1`，必然收到殘缺的單一 frame。
   **建議**：讓 `Subscriber` 的 CONFLATE 可設定，並在 README 標明。順帶記錄：`SNDHWM`/`RCVHWM` 與 multipart **相容**（以訊息則數計算，實測 `SNDHWM=5` 時不論每則幾個 frame 都剛好卡在 5 則），這點常被誤解。
 
-- [ ] **`ShmReader` 建構失敗只印訊息不拋例外**（若採用 blob 方案則隨 `shm_util` 一併移除）
-  [shm_util.py:127-129](src/lemegeton/shm_util.py#L127-L129)：留下半初始化物件，之後 `get_data()` 只會靜默回傳 `None`，問題難以追查。
+- [x] ✅ ⚠️ **`shm_util` 已移除**（2026-08-13）
+  最初判斷它是死碼，但那次只掃了本 repo。實際呼叫點在 `platform/backpack`：
 
-- [ ] **共享記憶體沒有版本號，讀者可能讀到寫到一半的緩衝**（同上）
-  [shm_util.py:35-36](src/lemegeton/shm_util.py#L35-L36)（原始碼已有 `# Todo: id check`）：三緩衝可降低但無法消除撕裂讀取；建議每個緩衝加上寫入序號，讀完再比對一次。
+  | 角色 | 檔案 |
+  | --- | --- |
+  | 生產端 | `sensor_service/src/solsensor/core/utils/interface_host.py`（`ShmHost` + `get_metadata()` + `release()`） |
+  | 消費端 | `sensor_service/src/solsensor/service/sensor_manager.py`（`open_reader()`） |
+  | 消費端 | `control_arbitration_service/libs/sensor_api/src/solsensor_api/image_client.py`（`ShmReader`，且已有 `Subscriber` 備援路徑） |
 
-- [ ] **`ShmReader` 依賴 CPython 私有 API**（同上）
-  [shm_util.py:120-125](src/lemegeton/shm_util.py#L120-L125)：`resource_tracker.unregister` 與 `SharedMemory._name` 非公開介面，Python 版本升級可能失效。另 `get_metadata` 用 `self.data_type.__name__`（[shm_util.py:65](src/lemegeton/shm_util.py#L65)），傳入 `np.dtype(...)` 實例時會壞掉，只支援 type 物件。
+  **決議**：本 repo 先行移除，`sensor_service` 端由使用者後續更新。
+  刪除前做了跨行程實測，確認 blob 取代 shm 的成本可接受：
+
+  | 解析度 | shm（寫+讀） | blob（生產者） | 差距 | 佔 30fps 預算 |
+  | --- | --- | --- | --- | --- |
+  | 720p | 0.13ms | 0.54ms | +0.46ms | 1.6% |
+  | 1080p | 0.22ms | 1.26ms | +1.12ms | 3.8% |
+  | 4K | 2.49ms | 4.31ms | +2.74ms | 12.9% |
+
+  ⚠️ **4K 高幀率要留意**：4K@60fps 時 blob 會佔到約 26% 的單幀預算。
+  遷移的有利條件：`image_client.py` 已有「shm 或 ZMQ topic」雙路徑，可沿用同一個分支結構。
 
 ---
 
@@ -192,7 +205,7 @@
 - [ ] **`MANIFAST.in` 檔名拼錯**（應為 `MANIFEST.in`）→ setuptools 完全不會讀取，sdist 內容可能缺檔。
 
 - [ ] **`pyproject.toml` 設定缺漏**
-  `shm_util` 需要 `numpy` 但未列入 `dependencies`；`testpaths = ["tests"]` 但實際目錄是 `test/`；`description` 為空；`build-system` 要求 `setuptools_scm` 卻使用靜態 `version`。
+  ~~`shm_util` 需要 `numpy` 但未列入 `dependencies`~~（✅ 已加入）；`testpaths = ["tests"]` 但實際目錄是 `test/`；`description` 為空；`build-system` 要求 `setuptools_scm` 卻使用靜態 `version`。
 
 - [ ] **全專案以 `print` 輸出，且多處關鍵訊息被註解掉**
   例如 [client.py:63-96](src/lemegeton/client.py#L63-L96)、[gateway.py:330-339](src/lemegeton/gateway.py#L330-L339)：連線失敗、註冊被拒等重要事件在正式環境完全無跡可循。建議改用 `logging` 並分級。
@@ -303,4 +316,4 @@
 1. ~~**先修 P0 中會讓服務「靜默失效」的三項**：Gateway Redis 回填格式（服務永遠找不到）、`ActionFeedbackSubscriber` 閒置逾時、`Responder` 例外不回覆。~~ ✅ 已完成
 2. 接著補齊 **Client 端連線競態**（endpoint 為 None、DEALER 併發、心跳線程死亡），這幾項決定框架能否長時間穩定運行。
 3. 再處理 **關閉與資源回收**（`ActionClient.close`、`ActionServer.close`、`Broker`）。
-4. 最後是建置與部署（`compile_protos.sh`、`MANIFEST.in`、numpy 相依、容器權限）。
+4. 最後是建置與部署（`compile_protos.sh`、`MANIFEST.in`、容器權限）。

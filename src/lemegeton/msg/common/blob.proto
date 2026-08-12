@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package lemegeton.msg.common.blob;
+
+// 一塊多維數值資料。shape / dtype 仍是有型別的欄位；
+// data 小的時候直接內嵌，大的時候會被搬到 protobuf 訊息體外。
+// 兩種模式共用同一份 schema，收端不需要知道發端選了哪種。
+message Blob {
+  repeated int32 shape = 1;   // 例如 [1080, 1920, 3]
+  string dtype = 2;           // "uint8" / "float64" ...
+  bytes data = 3;             // 搬出訊息體時留空
+}
+
+// 以下兩個是框架內部的線路結構，使用者不會直接碰
+
+message BlobSpec {
+  string field = 1;           // 欄位路徑，例如 "rgb" 或 "body"
+  repeated int32 shape = 2;
+  string dtype = 3;
+  uint64 offset = 4;
+  uint64 size = 5;
+}
+
+message BlobEnvelope {
+  string type_url = 1;        // header 的完整型別名，收端據此驗證
+  bytes header = 2;           // 序列化後的使用者訊息（大欄位已剝除）
+  repeated BlobSpec blobs = 3;
+}
