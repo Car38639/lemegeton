@@ -380,6 +380,12 @@ class ActionServer(ServiceCore):
             except Exception as e:
                 raise Exception(f"[{name}] Fail to bind {self._tcp_port}: {e}")
 
+        if self._enable_ipc:
+            try:
+                self._goal_socket.bind(f"ipc://{self._ipc_path}")
+            except Exception as e:
+                raise Exception(f"[{name}] Fail to bind ipc://{self._ipc_path}: {e}")
+
         # 2. 初始化 Feedback Publisher
         self._feedback_pub_lock = threading.Lock()  # 增加 Feedback Publisher 的鎖
         self._feedback_pub = Publisher(

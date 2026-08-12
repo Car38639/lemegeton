@@ -5,7 +5,7 @@
 
 | 分類 | 數量 | 已修正 |
 | --- | --- | --- |
-| P0 正確性錯誤 | 10 | 8 |
+| P0 正確性錯誤 | 10 | 9 |
 | P1 穩健性 / 資源管理 | 19 | 2 |
 | P2 專案 / 建置 / 工具 | 10 | 0 |
 | 安全性與部署風險 | 7 | 0 |
@@ -54,10 +54,11 @@
   本地快取命中時回傳 `res_info["data"]`，但 Redis 命中時回傳整包 `{"data": ..., "service_id": ..., "last_seen": ...}`。Client 端讀 `resp["data"]["type"]` 會取不到 → 一律判定型別不符；同時 `local_cache[name] = {"data": data}` 又把結構再包一層，污染後續查詢。
   **已修正**：改為先回填快取（保持與 `local_cache` 相同層級）再統一從 `res_info["data"]` 取值，兩條路徑共用同一段回覆邏輯；缺 `data` 欄位時回 `NOT_FOUND` 而非 `KeyError` 讓 Gateway 崩潰。
 
-- [ ] ⚠️ **`ActionServer` 在 `mode="ipc"` 時完全沒有 bind**
-  [server.py:364-368](src/lemegeton/server.py#L364-L368)
+- [x] ✅ ⚠️ **`ActionServer` 在 `mode="ipc"` 時完全沒有 bind**
+  [server.py:377-387](src/lemegeton/server.py#L377-L387)
   只處理 `self._enable_tcp`，但 `ServiceCore` 仍會把 ipc endpoint 註冊到 Gateway，Client 於是連到一個不存在的位址（且 `localhost` 情況下 Client 會優先選 ipc，見 [client.py:47-52](src/lemegeton/client.py#L47-L52)）。
-  **建議**：補上 ipc bind，或在 `ActionServer` 明確拒絕 `ipc`/`both`。
+  **實測後發現影響比原本記錄的更廣**：`mode="both"` 同樣失效 —— ROUTER 只綁了 tcp，但 localhost 的 client 一律優先挑 ipc，於是照樣連到不存在的位址。而且 `send_goal` **完全不報錯**，只是結果永遠不會回來（實測 `TimeoutError`），屬於最難查的靜默失效。
+  **已修正**：ROUTER socket 補上 ipc bind，與 `Responder` / `Publisher` / `Subscriber` 的作法一致（feedback Publisher 本來就會依 `mode` 自行雙綁，不需另外處理）。
 
 - [x] ✅ ⚠️ **`ActionClient` 的 DEALER socket 被兩個執行緒同時使用**
   [client.py](src/lemegeton/client.py)
@@ -241,6 +242,7 @@
 | T2 8 執行緒併發 32 個 goal ＋ 8 次併發 cancel | DEALER 無鎖，行為未定義 | ✅ 32/32 完成（24 SUCCEEDED / 8 CANCELED），0 例外，1.7s |
 | T3 `docker restart lemegeton-gateway` | 心跳線程死亡，服務換 port 後永遠追不上 | ✅ 心跳/接收線程全存活；停機期間既有 PUB/SUB 不受影響；服務換 port 後 Requester `43961→44179`、Subscriber `42381→48067`，13.1s 內全部恢復 |
 | T4 gateway 不可達（query_port 指向空埠） | 2 秒後 `Heartbeat error: Operation cannot be accomplished in current state`，線程終止 | ✅ 持續重試，6 秒觀察期間線程恆存活 |
+| T5 ActionServer `mode="ipc"` / `"both"` | 兩種模式都失敗：client 解析到 ipc endpoint，`send_goal` 不報錯但結果永不回來（`TimeoutError`） | ✅ 兩種模式皆 `SUCCEEDED`，feedback 也經 ipc 正常送達 |
 
 > 同名重啟要等 **18 秒**才成功（重試上限 `2 × HEARTBEAT_RATE + 5 = 25` 秒），對需要快速重啟的服務
 > 偏長且離上限不遠。可考慮縮短 TTL 或提高心跳頻率，見上方 P1「服務崩潰後 20 秒內無法以同名重啟」。
