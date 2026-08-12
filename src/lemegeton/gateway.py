@@ -1,11 +1,11 @@
-import json
+import errno
+import socket
 import threading
 import time
 import uuid
 from enum import Enum
 from typing import Optional
 
-import redis
 import zmq
 
 
@@ -52,11 +52,10 @@ class Gateway:
     # 這段緩衝可避免把正在啟動的服務誤判為已死。
     PROBE_GRACE = 3.0
 
-    def __init__(
-        self, port: Optional[int] = None, redis_conf={"host": "localhost", "port": 6379}
-    ):
-        self.r = redis.Redis(**redis_conf, decode_responses=True)
-        self.local_cache = {}  # 格式: {name: {"data": dict, "last_seen": float}}
+    def __init__(self, port: Optional[int] = None):
+        # 註冊表就是這個 dict，沒有外部儲存。
+        # 格式: {name: {"data": dict, "service_id": str, "last_seen": float}}
+        self.local_cache = {}
         self.context = zmq.Context()
         self.ttl = 2 * Gateway.HEARTBEAT_RATE  # 設定2倍心跳的秒數為過期門檻
 
@@ -78,7 +77,27 @@ class Gateway:
         self.poller.register(self.heartbeat_sock, zmq.POLLIN)
         self.poller.register(self.query_sock, zmq.POLLIN)
 
-        self.last_sync_time = time.time()
+        self.last_cleanup_time = time.time()
+
+    @staticmethod
+    def _address_in_use(family, address, reuse_addr=False) -> Optional[bool]:
+        """試綁一個位址。True = 已被佔用，False = 沒人在聽，None = 無法判斷。
+
+        這裡刻意用標準 socket 而不是 ZMQ socket：ZMQ 的 close() 是非同步的，
+        探測用的 socket 會短暫留住該 port，剛好撞上服務重啟時配到同一個 port
+        就會害它 bind 失敗。標準 socket 的 close() 是同步的，不留殘影。
+        """
+        probe = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            if reuse_addr:
+                # 允許跨過 TIME_WAIT，但若真的有 listener 仍會是 EADDRINUSE
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(address)
+            return False
+        except OSError as e:
+            return True if e.errno == errno.EADDRINUSE else None
+        finally:
+            probe.close()
 
     def _owner_is_alive(self, info) -> bool:
         """探測舊註冊的擁有者是否還活著。
@@ -88,27 +107,31 @@ class Gateway:
         這樣崩潰的服務不必等滿 TTL 才能被同名重啟接管。
         """
         endpoint = (info.get("data") or {}).get("endpoint") or {}
-        addresses = []
-        if endpoint.get("ipc"):
-            addresses.append(f"ipc://{endpoint['ipc']}")
-        if endpoint.get("tcp"):
-            addresses.append(f"tcp://*:{endpoint['tcp']}")
+        results = []
 
-        if not addresses:
-            # 沒有端點資訊就無從判斷，保守視為還活著
-            return True
+        ipc_path = endpoint.get("ipc")
+        if ipc_path:
+            if ipc_path.startswith("@"):
+                # ZMQ 的 ipc://@name 對應 Linux abstract socket，位址是 "\0name"
+                results.append(
+                    self._address_in_use(socket.AF_UNIX, "\0" + ipc_path[1:])
+                )
+            else:
+                results.append(None)  # 檔案系統路徑的 ipc，無法用試綁判斷
 
-        for address in addresses:
-            probe = self.context.socket(zmq.REP)
-            probe.setsockopt(zmq.LINGER, 0)
-            try:
-                probe.bind(address)
-            except zmq.ZMQError:
-                probe.close()
-                return True  # 綁不起來 → 還有人在監聽
-            finally:
-                probe.close()
-        return False
+        tcp_port = endpoint.get("tcp")
+        if tcp_port:
+            results.append(
+                self._address_in_use(
+                    socket.AF_INET, ("", int(tcp_port)), reuse_addr=True
+                )
+            )
+
+        if any(r is True for r in results):
+            return True  # 任一端點還被佔著 → 還活著
+        if any(r is False for r in results):
+            return False  # 有明確結論且都沒人在聽 → 已死
+        return True  # 沒有端點資訊或無法判斷，保守視為還活著
 
     def _can_take_over(self, name, current_service, request_service_id):
         """判斷同名的舊註冊是否已失效，可讓新的 service_id 接管"""
@@ -126,32 +149,20 @@ class Gateway:
         )
         return True
 
-    def sync_and_cleanup(self):
-        """同步數據至 Redis 並清理本地過期快取"""
+    def cleanup_stale(self):
+        """清理心跳已過期的服務"""
         now = time.time()
-        stale_keys = []
+        stale_keys = [
+            name
+            for name, info in self.local_cache.items()
+            if now - info.get("last_seen", 0) > self.ttl
+        ]
 
-        # 找出已過期的 Key
-        for name, info in self.local_cache.items():
-            if now - info["last_seen"] > self.ttl:
-                stale_keys.append(name)
-
-        # 執行清理
         for name in stale_keys:
             del self.local_cache[name]
-            # 同步刪除 Redis 中的資料
-            self.r.delete(f"svc:{name}")
             print(f"[Cleanup] 服務 {name} 已過期，執行清理")
 
-        # 同步剩餘的活躍數據至 Redis
-        if self.local_cache:
-            pipe = self.r.pipeline()
-            for name, info in self.local_cache.items():
-                pipe.set(f"svc:{name}", json.dumps(info), ex=self.ttl)
-            pipe.execute()
-            print(f"[Sync] 同步 {len(self.local_cache)} 個活躍服務至 Redis")
-
-        self.last_sync_time = now
+        self.last_cleanup_time = now
 
     def run(self):
         print("Gateway 啟動成功，進入監聽狀態...")
@@ -208,7 +219,6 @@ class Gateway:
                             and current_service.get("service_id") == request_service_id
                         ):
                             del self.local_cache[name]
-                            self.r.delete(f"svc:{name}")
                             print(f"[Unregister] 服務 {name} 已被註銷")
                             self.registry_sock.send_json(
                                 {"status": GatewayStatus.SUCCESS.value}
@@ -234,37 +244,19 @@ class Gateway:
                     current_service = self.local_cache.get(name)
 
                     if not current_service:
-                        # 本地無此服務，從 Redis 查詢資料
-                        val = self.r.get(f"svc:{name}")
-                        if val:
-                            info = json.loads(val)
-                            if info.get("service_id") != new_service_id:
-                                print(
-                                    f"[Warning] 服務名稱 '{name}' ID 不符合。從 Redis 查詢到的 ID 與心跳請求的 ID 不匹配。"
-                                )
-                                self.heartbeat_sock.send_json(
-                                    {"status": GatewayStatus.MISMATCH.value}
-                                )
-                            else:
-                                self.local_cache[name] = info
-                                print(
-                                    f"[Heartbeat] 服務 '{name}' 從 Redis 回填至本地快取，ID: {new_service_id}"
-                                )
-                                self.heartbeat_sock.send_json(
-                                    {"status": GatewayStatus.SUCCESS.value}
-                                )
-                        else:
-                            print(
-                                f"[Heartbeat] 服務 '{name}' 不存在於本地快取和 Redis 中，將其註冊到本地快取，ID: {new_service_id}"
-                            )
-                            self.local_cache[name] = {
-                                "data": msg.get("data"),
-                                "service_id": new_service_id,
-                                "last_seen": time.time(),
-                            }
-                            self.heartbeat_sock.send_json(
-                                {"status": GatewayStatus.SUCCESS.value}
-                            )
+                        # 註冊表不認得這個名稱（例如 gateway 剛重啟過），
+                        # 直接把這次心跳當成重新註冊，讓服務自行癒合。
+                        print(
+                            f"[Heartbeat] 服務 '{name}' 不在註冊表中，以本次心跳重新註冊，ID: {new_service_id}"
+                        )
+                        self.local_cache[name] = {
+                            "data": msg.get("data"),
+                            "service_id": new_service_id,
+                            "last_seen": time.time(),
+                        }
+                        self.heartbeat_sock.send_json(
+                            {"status": GatewayStatus.SUCCESS.value}
+                        )
 
                     elif current_service.get("service_id") != new_service_id:
                         print(f"[Warning] 服務名稱 '{name}' ID 不符合。")
@@ -285,17 +277,6 @@ class Gateway:
                     name = msg.get("name")
 
                     res_info = self.local_cache.get(name)
-                    if not res_info:
-                        # 本地無則查 Redis。Redis 內的格式與 local_cache 相同：
-                        # {"data": ..., "service_id": ..., "last_seen": ...}
-                        # 回填時必須保持同一層級，否則後續查詢會多包一層而失效
-                        val = self.r.get(f"svc:{name}")
-                        if val:
-                            res_info = json.loads(val)
-                            res_info.setdefault("last_seen", time.time())
-                            self.local_cache[name] = res_info
-                            print(f"[Query] 服務 '{name}' 從 Redis 回填至本地快取")
-
                     if res_info and res_info.get("data"):
                         self.query_sock.send_json(
                             {
@@ -308,9 +289,9 @@ class Gateway:
                             {"status": GatewayStatus.NOT_FOUND.value}
                         )
 
-                # 每 5 秒執行一次同步與清理
-                if time.time() - self.last_sync_time > 5:
-                    self.sync_and_cleanup()
+                # 每 5 秒清理一次心跳過期的服務
+                if time.time() - self.last_cleanup_time > 5:
+                    self.cleanup_stale()
 
         except KeyboardInterrupt:
             print("\nServer is shutting down...")

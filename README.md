@@ -1,6 +1,6 @@
 # Lemegeton
 
-以 **ZeroMQ + Protobuf** 為基礎的輕量分散式通訊框架，提供類似 ROS 的 Pub/Sub、Request/Response、Action 三種通訊模式，並透過一個中央 **Gateway**（服務註冊表 + Redis）讓服務端與客戶端只靠「服務名稱」互相尋址，不需要硬編 IP 與 port。
+以 **ZeroMQ + Protobuf** 為基礎的輕量分散式通訊框架，提供類似 ROS 的 Pub/Sub、Request/Response、Action 三種通訊模式，並透過一個中央 **Gateway**（服務註冊表）讓服務端與客戶端只靠「服務名稱」互相尋址，不需要硬編 IP 與 port。
 
 主要用於人形機器人（humanoid）的遙操作與控制訊息傳遞，內建 teleop、robot control、state、kinematic 等 Protobuf 訊息定義。
 
@@ -19,13 +19,13 @@
 
 ## 安裝
 
-需求：Python >= 3.9、`protobuf-compiler`（若要自行編譯 `.proto`）、Redis（Gateway 使用）。
+需求：Python >= 3.9、`protobuf-compiler`（若要自行編譯 `.proto`）。Gateway 不需要任何外部資料庫。
 
 ```bash
 pip install .
 ```
 
-相依套件：`protobuf`、`pyzmq`、`redis`。
+相依套件：`protobuf`、`pyzmq`。
 （`shm_util` 另外需要 `numpy`，目前未列入 `dependencies`，使用前請自行安裝。）
 
 ---
@@ -38,7 +38,7 @@ pip install .
                  │  ipc://@lemegeton_registry   註冊 / 註銷 │
                  │  ipc://@lemegeton_heartbeat  心跳       │
                  │  tcp://*:60001               名稱查詢   │
-                 │            Redis (svc:<name>)           │
+                 │      註冊表 = 行程內的 dict（無外部儲存） │
                  └─────────────────────────────────────────┘
                       ▲                             ▲
        註冊 + 心跳(IPC)│                             │名稱查詢(TCP)
@@ -52,7 +52,8 @@ pip install .
 
 - `lemegeton.server.*`：**bind** 端，會向 Gateway 註冊自己的 endpoint（透過 IPC，因此必須與 Gateway 在同一台機器 / 同一個 IPC namespace）。
 - `lemegeton.client.*`：**connect** 端，透過 TCP 向 Gateway（預設 `localhost:60001`）查詢名稱對應的 endpoint。
-- Gateway 以 `local_cache` + Redis 保存服務資訊，每 5 秒同步一次；超過 20 秒（2 × 心跳週期 10 秒）沒有心跳的服務會被清除。
+- Gateway 把服務資訊保存在行程內的 `local_cache`，每 5 秒清理一次；超過 20 秒（2 × 心跳週期 10 秒）沒有心跳的服務會被移除。
+- Gateway 重啟後註冊表是空的，但服務的下一次心跳會自動重新註冊（最多 10 秒），不需要外部儲存來持久化。
 - 服務名稱具唯一性：同名但 `service_id` 不同的註冊請求會被拒絕（`ALREADY_EXISTS`）。
 
 ### 角色配對
@@ -73,17 +74,17 @@ pip install .
 
 ### 1. 啟動 Gateway
 
-Gateway 需要 Redis。最簡單的方式是使用 `deploy/` 下的 compose：
-
-```bash
-cd deploy
-docker compose up -d      # 啟動 redis + lemegeton-gateway（network_mode: host, ipc: host）
-```
-
-或是本機直接跑（需自備 Redis）：
+Gateway 沒有外部相依，直接跑起來即可：
 
 ```bash
 python3 deploy/main.py
+```
+
+或使用 `deploy/` 下的 compose：
+
+```bash
+cd deploy
+docker compose up -d      # lemegeton-gateway（network_mode: host, ipc: host）
 ```
 
 ### 2. Publisher / Subscriber
@@ -304,7 +305,7 @@ docker exec -it test_container bash
 | 項目 | 預設值 | 位置 |
 | --- | --- | --- |
 | Gateway 查詢埠 | `60001` | `Gateway.DEFAULT_QUERY_PORT` |
-| Redis | `localhost:6379` | `Gateway(redis_conf=...)` |
+| 過期清理週期 | `5` 秒 | `Gateway.run()` |
 | 服務心跳週期 | `10` 秒 | `Gateway.HEARTBEAT_RATE` |
 | 服務過期 TTL | `20` 秒 | `2 × HEARTBEAT_RATE` |
 | Client 查詢週期 | `0.5` 秒 | `CLIENT_HEARTBEAT_INTERVAL` |

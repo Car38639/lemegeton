@@ -1,20 +1,20 @@
 # TODO — Bug 與風險清單
 
 以靜態閱讀 `src/lemegeton/`、`deploy/`、`test/` 與建置設定整理而成（2026-08-12）。
-標註 `⚠️` 者為會直接造成當機、掛死或行為錯誤的問題。未特別註明者皆為靜態分析結論，尚未以執行環境驗證（本機未安裝 `pyzmq` / `redis` / `protobuf`）。
+標註 `⚠️` 者為會直接造成當機、掛死或行為錯誤的問題。未特別註明者皆為靜態分析結論，尚未以執行環境驗證（本機未安裝 `pyzmq` / `protobuf`）。
 
 | 分類 | 數量 | 已修正 |
 | --- | --- | --- |
 | P0 正確性錯誤 | 10 | 10 |
-| P1 穩健性 / 資源管理 | 19 | 3 |
+| P1 穩健性 / 資源管理 | 19 | 4 |
 | P2 專案 / 建置 / 工具 | 10 | 0 |
-| 安全性與部署風險 | 7 | 0 |
+| 安全性與部署風險 | 7 | 1 |
 | 部署與版本落差 | 2 | 2 |
 
 > 已修正項目標記為 ✅。驗證分兩層：
-> 1. **stub 單元驗證**：以 stub 取代 `pyzmq` / `redis`，直接驅動 `Responder._response_process`、
+> 1. **stub 單元驗證**：以 stub 取代 `pyzmq`，直接驅動 `Responder._response_process`、
 >    `Gateway.run()` 查詢分支、`ActionFeedbackSubscriber._subscribe_process`。
-> 2. **端到端驗證**：對接執行中的 `lemegeton-gateway` + `redis`，先以掛載原始碼與舊版做對照，
+> 2. **端到端驗證**：對接執行中的 `lemegeton-gateway`，先以掛載原始碼與舊版做對照，
 >    重建映像後再以**部署版本本身**（`site-packages`，未掛 `PYTHONPATH`）複測，四項全過。
 >
 > 部署映像原本比 repo 多兩處未進版控的修改，已回填至 [gateway.py](src/lemegeton/gateway.py)；
@@ -88,20 +88,28 @@
   [client.py](src/lemegeton/client.py)：心跳線程與心跳 socket 洩漏；且在 `_init_sockets()` 之前呼叫 `close()` 會因 `self._stop_event` 未建立而 `AttributeError`。
   **已修正**：`close()` 補上 `super().close()`；`_stop_event` / `dealer_socket` / `_dealer_lock` 改在 `__init__` 最前段就建立。
 
-- [ ] **Gateway 對 Redis 完全沒有錯誤處理**
-  [gateway.py:93-101](src/lemegeton/gateway.py#L93-L101)、[gateway.py:236](src/lemegeton/gateway.py#L236)：Redis 斷線或逾時會讓 `run()` 整個拋出，Gateway 直接下線 → 所有服務失去尋址能力。建議 Redis 只當作備援快取，失敗時降級為純本地快取。
+- [x] ✅ **Gateway 對 Redis 完全沒有錯誤處理**
+  Redis 斷線或逾時會讓 `run()` 整個拋出，Gateway 直接下線 → 所有服務失去尋址能力。一個為了提升韌性而加的元件，反而成為單點故障。
+  **已修正 —— 直接移除 Redis**。分析後確認它的唯一作用是「縮短 gateway 重啟後的空窗」，而沒有它時服務的下一次心跳（≤10 秒）就會自動重新註冊，空窗本來就有界。三個佐證：
+  1. 查詢路徑的 Redis 回填長期壞著（見上方 P0 的多包一層 bug），實際行為等同沒有 Redis，而沒有人發現。
+  2. REGISTER 分支從不讀 Redis，所以它連「跨重啟的名稱唯一性」都沒有保障。
+  3. 跨主機共用註冊表做不到 —— 註冊與心跳走 abstract IPC socket（作用域是 network namespace），服務只能向同機的 gateway 註冊。
+  註冊表現在就是行程內的 dict，`sync_and_cleanup` 改名為 `cleanup_stale` 且只做過期清理，`Gateway.__init__` 移除 `redis_conf` 參數，套件相依與 `deploy/docker-compose.yml` 的 redis service 一併拿掉。
+  **實測（`--network none` 的完全隔離容器，自建 gateway）**：殺掉 gateway 再重啟，服務**6.5 秒**就靠心跳自行重新註冊完成（上限是一個心跳週期 10 秒），停機期間既有的 PUB/SUB 與 REQ/REP 連線完全不受影響。
+  附帶收穫：Gateway 沒有外部相依之後，整套系統可以在隔離的 network namespace 裡跑完整測試，不必再碰線上的 gateway。
 
 - [ ] **Gateway 對非法輸入沒有防護**
   三個 REP socket 都直接 `recv_json()`，收到非 JSON 或缺欄位的訊息就拋例外並終止服務；`GatewayStatus.INVALID_FORMAT`（[gateway.py:27](src/lemegeton/gateway.py#L27)）定義了卻從未使用。
 
 - [ ] **Gateway 是單執行緒 + 阻塞式 REP**
-  任一分支（含 Redis I/O）阻塞就會拖住註冊、心跳與查詢；REP 模式下若某個 client 送了請求卻不收回應，該 socket 亦會卡在 send 狀態。
+  任一分支阻塞就會拖住註冊、心跳與查詢；REP 模式下若某個 client 送了請求卻不收回應，該 socket 亦會卡在 send 狀態。
 
 - [x] ✅ **服務崩潰後 20 秒內無法以同名重啟**
   [gateway.py](src/lemegeton/gateway.py) + [server.py:45-48](src/lemegeton/server.py#L45-L48)：舊紀錄要等 TTL（2 × 10 秒）過期才會清掉，期間新程序註冊被回 `ALREADY_EXISTS`，`ServiceCore` 直接 `raise` → 服務起不來。
   **分兩階段修正**：
   1. TTL 接管 + 註冊重試（原本只存在於部署映像，已回填進版控）：`last_seen` 超過 TTL 的舊條目允許新 `service_id` 接管，`HeartbeatClient` 註冊失敗重試至 TTL+5 秒才放棄。**但實測仍要等 18.0 秒**（TTL 20 秒扣掉最後一次心跳的時間差），而重試上限是 25 秒，只剩 7 秒餘裕。
   2. 主動存活探測（本次）：新增 `Gateway._owner_is_alive()`，試著去綁舊註冊的端點 —— 綁得起來代表沒人在監聽、行程已死，可**立刻**接管，不必等滿 TTL。純 gateway 端改動，不動通訊協定，對舊版 client 完全相容（相對之下，調快心跳頻率會讓還沒升級的服務被誤判過期）。
+  探測刻意用**標準 socket 而非 ZMQ socket**：ZMQ 的 `close()` 是非同步的，探測用的 socket 會短暫留住那個 port，若重啟的服務剛好被 `_allocate_port()` 配到同一個 port 就會 bind 失敗（測試中實際撞到過）。標準 socket 的 `close()` 是同步的，不留殘影；TCP 探測加 `SO_REUSEADDR` 以跨過 TIME_WAIT，但真的有 listener 時仍會是 `EADDRINUSE`。
   服務是「先註冊、後 bind」，剛註冊完的瞬間端點還沒綁上，因此加了 `PROBE_GRACE = 3.0` 秒緩衝，避免把正在啟動的服務誤判為已死；同一個 `service_id` 重送註冊則完全不觸發探測。
   **部署版實測：接管耗時 18.0s → 0.0s**，且服務還活著時同名註冊仍被正確拒絕（`ALREADY_EXISTS`）。
 
@@ -189,8 +197,9 @@
 - [ ] **服務註冊表可被任意寫入**
   註冊 / 註銷只靠 `name` + 自報的 `service_id`，沒有任何憑證。惡意行程可搶先占用名稱造成 DoS，或註冊自己的 endpoint 讓 Client 連到假服務（中間人）。
 
-- [ ] **Redis 無密碼且使用 `network_mode: host`**
-  [deploy/docker-compose.yml](deploy/docker-compose.yml)：`svc:*` 可被同網段任意讀寫，直接繞過 Gateway 竄改路由資訊。至少應綁定 127.0.0.1 或設定 `requirepass`。
+- [x] ✅ **Redis 無密碼且使用 `network_mode: host`**
+  `svc:*` 可被同網段任意讀寫，直接繞過 Gateway 竄改路由資訊（把 client 導向任意 endpoint）。
+  **已隨 Redis 移除而消失** —— 註冊表不再有無認證的外部副本。
 
 - [ ] **容器使用 `privileged: true` 並掛載 `/dev`**
   [docker-compose.yml](docker-compose.yml)、[deploy/docker-compose.yml](deploy/docker-compose.yml)：容器逃逸風險；Gateway 服務本身並不需要這些權限。
@@ -201,8 +210,9 @@
 - [ ] **`deploy/Dockerfile` 缺 `protobuf-compiler`，且 `apt autoremove` 前沒有 `apt update`**
   [deploy/Dockerfile](deploy/Dockerfile)：映像內無法執行 `compile_protos`；compose 又以 `..:/root/workspace` 覆蓋掉 `pip install .` 的來源目錄，實際跑的是掛載進去的原始碼而非安裝版本，行為容易不一致。
 
-- [ ] **啟動順序與硬體假設**
-  `deploy` 的 Gateway 沒有 `depends_on: redis`，僅靠 `restart: always` 反覆重啟；根目錄 `docker-compose.yml` 寫死 `runtime: nvidia`，無 GPU 的機器無法啟動這個純 Python 開發容器。
+- [ ] **硬體假設**
+  根目錄 `docker-compose.yml` 寫死 `runtime: nvidia`，無 GPU 的機器無法啟動這個純 Python 開發容器。
+  （原本還有「Gateway 沒有 `depends_on: redis` 的啟動順序問題」，已隨 Redis 移除而消失。）
 
 ---
 
@@ -228,7 +238,7 @@
   cd deploy && docker compose up -d --build
   ```
 
-### 端到端實測結果（對接現存 gateway + redis）
+### 端到端實測結果（對接現存 gateway）
 
 修正前 = 舊映像 `site-packages`；修正後 = 重建後的部署映像本身（未掛 `PYTHONPATH`）。
 
@@ -251,6 +261,8 @@
 | T6 同名衝突（service_id 不同的實例對真實 gateway 心跳） | gateway 確實回 `MISMATCH`，但冒名者 6 秒後心跳線程仍存活，持續覆寫他人註冊 | ✅ 立即偵測、印出警告、`name_conflict=True`、線程自行結束 |
 | T7 存活探測單元測試（真實 zmq socket，9 種情境 + 3 種註冊分支） | — | ✅ 12/12：端點被佔用→活著、端點已關→已死、未過 grace 不探測、活著時不可接管、超過 TTL 可接管 |
 | T8 `kill -9` 後同名重啟（部署版） | 重試 9 次、**18.0s** 才接管，離 25s 上限只剩 7s | ✅ **0.0s** 立即接管；服務仍活著時同名註冊照樣被拒 |
+| T9 移除 Redis 後的全套驗證（`--network none` 隔離容器） | — | ✅ gateway 無外部相依即可啟動；殺掉再重啟後服務 **6.5s** 靠心跳自行重新註冊；停機期間既有連線不受影響 |
+| T10 隔離環境崩潰接管（`mode="both"`，tcp + ipc 雙探測） | — | ✅ 活著時拒絕、崩潰後 0.0s 接管、新服務順利綁到自己的 port（探測未留殘影） |
 
 > 上表「修正後」欄位自 T5 起皆為重建映像後的**部署版本**實測（未掛 `PYTHONPATH`）。
 > T1、T2 已於同一版本複測通過，確認 gateway 註冊路徑的改動沒有造成回歸。
@@ -265,4 +277,4 @@
 1. ~~**先修 P0 中會讓服務「靜默失效」的三項**：Gateway Redis 回填格式（服務永遠找不到）、`ActionFeedbackSubscriber` 閒置逾時、`Responder` 例外不回覆。~~ ✅ 已完成
 2. 接著補齊 **Client 端連線競態**（endpoint 為 None、DEALER 併發、心跳線程死亡），這幾項決定框架能否長時間穩定運行。
 3. 再處理 **關閉與資源回收**（`ActionClient.close`、`ActionServer.close`、`Broker`）。
-4. 最後是建置與部署（`compile_protos.sh`、`MANIFEST.in`、numpy 相依、Redis/容器權限）。
+4. 最後是建置與部署（`compile_protos.sh`、`MANIFEST.in`、numpy 相依、容器權限）。
