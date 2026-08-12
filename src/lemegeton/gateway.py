@@ -119,6 +119,14 @@ class Gateway:
 
                     if action == RegistryAction.REGISTER.value:
                         current_service = self.local_cache.get(name)
+                        # 只有「還活著」的舊條目才擋新註冊：崩潰的服務不會註銷,
+                        # 心跳斷了超過 TTL 就視同過期,直接讓新身份接管,
+                        # 不必等 sync_and_cleanup 剛好跑到。
+                        if current_service and (
+                            time.time() - current_service.get("last_seen", 0) > self.ttl
+                        ):
+                            print(f"[Registry] 服務 {name} 的舊註冊已過期，允許接管")
+                            current_service = None
                         if (
                             current_service
                             and current_service.get("service_id") != request_service_id
@@ -224,7 +232,18 @@ class Gateway:
                     name = msg.get("name")
 
                     res_info = self.local_cache.get(name)
-                    if res_info:
+                    if not res_info:
+                        # 本地無則查 Redis。Redis 內的格式與 local_cache 相同：
+                        # {"data": ..., "service_id": ..., "last_seen": ...}
+                        # 回填時必須保持同一層級，否則後續查詢會多包一層而失效
+                        val = self.r.get(f"svc:{name}")
+                        if val:
+                            res_info = json.loads(val)
+                            res_info.setdefault("last_seen", time.time())
+                            self.local_cache[name] = res_info
+                            print(f"[Query] 服務 '{name}' 從 Redis 回填至本地快取")
+
+                    if res_info and res_info.get("data"):
                         self.query_sock.send_json(
                             {
                                 "status": GatewayStatus.FOUND.value,
@@ -232,22 +251,9 @@ class Gateway:
                             }
                         )
                     else:
-                        # 本地無則查 Redis
-                        val = self.r.get(f"svc:{name}")
-                        if val:
-                            data = json.loads(val)
-                            # 回填本地快取
-                            self.local_cache[name] = {
-                                "data": data,
-                                "last_seen": time.time(),
-                            }
-                            self.query_sock.send_json(
-                                {"status": GatewayStatus.FOUND.value, "data": data}
-                            )
-                        else:
-                            self.query_sock.send_json(
-                                {"status": GatewayStatus.NOT_FOUND.value}
-                            )
+                        self.query_sock.send_json(
+                            {"status": GatewayStatus.NOT_FOUND.value}
+                        )
 
                 # 每 5 秒執行一次同步與清理
                 if time.time() - self.last_sync_time > 5:
@@ -277,11 +283,18 @@ class HeartbeatClient:
         self.name = name
         self.data = data
         self.service_id = str(uuid.uuid4())  # 生成本次啟動的唯一身份標籤
-        res = self._register_service()
-        if not res:
+        # 首次註冊失敗多半是暫時的:服務快速重啟時,gateway 裡上一世的註冊
+        # 要到 TTL(2倍心跳)後才過期;或 gateway 本身還沒起來。這兩種都會
+        # 自行解除,所以重試到略超過 TTL 再放棄,而不是一次失敗就讓整個
+        # 服務 crash 進 restart loop。
+        deadline = time.time() + 2 * Gateway.HEARTBEAT_RATE + 5
+        while not self._register_service():
             self.registry_sock.close()
             self.heartbeat_sock.close()
-            raise Exception(f"[{self.name}] Service registration failed")
+            if time.time() >= deadline:
+                raise Exception(f"[{self.name}] Service registration failed")
+            print(f"[{self.name}] Registration not accepted yet; retrying...")
+            time.sleep(2.0)
 
         self._heartbeat_event = threading.Event()
         self._heartbeat_thread = threading.Thread(

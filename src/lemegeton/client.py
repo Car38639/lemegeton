@@ -461,8 +461,9 @@ class ActionFeedbackSubscriber(ClientCore):
                         pass
 
             except zmq.Again:
-                self._timeout_flag.set()  # 通知 ActionClient 反饋接收超時
-                break
+                # 沒有 feedback 只代表目前閒置（沒有進行中的任務），不是錯誤。
+                # 服務真的離線會由心跳把 _endpoint 設為 None，由上面的分支處理。
+                continue
             except zmq.ContextTerminated:
                 break
             except Exception as e:
@@ -470,6 +471,11 @@ class ActionFeedbackSubscriber(ClientCore):
                 if self._sub_stop_event.is_set():
                     break
                 continue
+
+        # 非主動關閉卻離開迴圈，代表 feedback 通道已無法使用，
+        # 通知 ActionClient 一併結束 result listener
+        if not self._sub_stop_event.is_set():
+            self._timeout_flag.set()
 
         # 離開迴圈後清理
         if self._socket:

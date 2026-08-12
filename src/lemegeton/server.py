@@ -96,42 +96,55 @@ class Responder(ServiceCore):
 
     def _response_process(self):
         while not self._stop_event.is_set():
+            # --- 收 ---
             try:
                 if not self._socket.poll(100):
                     continue
 
                 message_bytes = self._socket.recv()
-                try:
-                    message = ProtobufMessageHandler.deserialize(
-                        self._message_class, message_bytes
-                    )
-                except Exception:
-                    print(f"Wrong message type, expect:{self._message_class.__name__}")
-                    empty_response = self._message_class()
-                    self._socket.send(ProtobufMessageHandler.serialize(empty_response))
-                    continue
-
-                # Handle the request
-                response_message = self._callback(message)
-                if not isinstance(response_message, self._response_class):
-                    print(
-                        f"Warning: Wrong message class, expect: {self._response_class.__name__}"
-                    )
-                    response_message = self._response_class()
-
-                response_bytes = ProtobufMessageHandler.serialize(response_message)
-                self._socket.send(response_bytes)
-
-            except Exception as e:
-                print(f"[{self._name}] Callback execution error: {e}")
-
             except zmq.ContextTerminated:
                 # 當 context 被關閉時，優雅退出
                 print(f"[{self._name}] Context terminated.")
                 break
-            except Exception as e:
-                # 捕捉其他非預期的 ZMQ 錯誤
-                print(f"[{self._name}] Unexpected error: {e}")
+            except zmq.ZMQError as e:
+                if self._stop_event.is_set():
+                    break
+                print(f"[{self._name}] Receive error: {e}")
+                continue
+
+            # --- 處理 ---
+            # REP socket 收到請求後「一定」要送出一次回應，
+            # 否則狀態機會停在等待 send 的狀態，之後每次 recv 都會失敗。
+            try:
+                message = ProtobufMessageHandler.deserialize(
+                    self._message_class, message_bytes
+                )
+            except Exception:
+                print(
+                    f"[{self._name}] Wrong message type, expect: {self._message_class.__name__}"
+                )
+                response_message = self._response_class()
+            else:
+                try:
+                    response_message = self._callback(message)
+                except Exception as e:
+                    print(f"[{self._name}] Callback execution error: {e}")
+                    response_message = self._response_class()
+
+                if not isinstance(response_message, self._response_class):
+                    print(
+                        f"[{self._name}] Warning: Wrong message class, expect: {self._response_class.__name__}"
+                    )
+                    response_message = self._response_class()
+
+            # --- 送 ---
+            try:
+                self._socket.send(ProtobufMessageHandler.serialize(response_message))
+            except zmq.ContextTerminated:
+                print(f"[{self._name}] Context terminated.")
+                break
+            except zmq.ZMQError as e:
+                print(f"[{self._name}] Failed to send response: {e}")
                 if self._stop_event.is_set():
                     break
 
