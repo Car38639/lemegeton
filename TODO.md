@@ -6,8 +6,8 @@
 | 分類 | 數量 | 已修正 |
 | --- | --- | --- |
 | P0 正確性錯誤 | 10 | 10 |
-| P1 穩健性 / 資源管理 | 19 | 4 |
-| P2 專案 / 建置 / 工具 | 10 | 0 |
+| P1 穩健性 / 資源管理 | 21 | 7 |
+| P2 專案 / 建置 / 工具 | 11 | 0 |
 | 安全性與部署風險 | 7 | 1 |
 | 部署與版本落差 | 2 | 2 |
 
@@ -113,20 +113,23 @@
   服務是「先註冊、後 bind」，剛註冊完的瞬間端點還沒綁上，因此加了 `PROBE_GRACE = 3.0` 秒緩衝，避免把正在啟動的服務誤判為已死；同一個 `service_id` 重送註冊則完全不觸發探測。
   **部署版實測：接管耗時 18.0s → 0.0s**，且服務還活著時同名註冊仍被正確拒絕（`ALREADY_EXISTS`）。
 
-- [ ] **Action 的最後一筆 feedback 會被 RESULT 搶先而遺失**（端到端實測發現）
-  [client.py:651-663](src/lemegeton/client.py#L651-L663)
-  RESULT 走 DEALER、feedback 走 SUB，是兩條獨立通道。Server 送完最後一筆 feedback 後緊接著送 RESULT，Client 的 result listener 先收到 RESULT 就呼叫 `untrack_goal()`，稍後才抵達的最後一筆 feedback 因為已不在 `active_goals` 而被丟棄。
-  **實測**：callback 送完最後一筆 feedback 立刻回傳 → 9 筆只收到 8 筆（3 次任務中有 1 次掉最後一筆）；在最後一筆 feedback 後停留 0.5 秒再回傳 → 9/9 全收。
-  **建議**：`untrack_goal` 延後執行（例如收到 RESULT 後再保留數百毫秒），或由 Server 在 RESULT 幀帶上 feedback 序號讓 Client 等齊，或乾脆讓最後一筆進度隨 RESULT 一起送。
+- [x] ✅ **Action 的最後一筆 feedback 會被 RESULT 搶先而遺失**（端到端實測發現）
+  RESULT 走 DEALER、feedback 走 SUB，是兩條獨立通道。Server 送完最後一筆 feedback 後緊接著送 RESULT，Client 的 result listener 先收到 RESULT 就呼叫 `untrack_goal()`，稍後才抵達的 feedback 因為已不在 `active_goals` 而被丟棄。
+  **實際影響比原本記錄的嚴重得多**。原先只在快速情境測到「9 筆掉 1 筆」，但只要使用者的 feedback callback 稍慢（每筆 40ms），RESULT 會在**第一個 callback 還在執行時**就抵達並解除追蹤 —— 實測舊版每個任務 3 筆只收到 **1 筆（6/18）**。
+  **已修正**：Server 為每個 goal 的 feedback 編流水號，並在 RESULT 幀附上總筆數；Client 收到 RESULT 後，先等 `received_seq` 追上總數（上限 `feedback_grace`，預設 0.3 秒）才解除追蹤並完成 Future。計數在**使用者 callback 執行完之後**才遞增，因此「收齊」等於「所有進度都已送到使用者手上」，也保證 feedback 不會出現在 `result_callback` 之後。實測 18/18，順序全部正確。
+  **線路格式相容**：feedback 由 `[goal_id, payload]` 變成 `[goal_id, payload, seq]`，RESULT 由 6 幀變成 7 幀，新欄位都**附加在尾端**，新舊混用皆已實測通過（新 server + 舊 client、舊 server + 新 client 都能完成任務並收到 3 筆 feedback）。
 
 - [ ] **`_allocate_port` 有 TOCTOU 競爭**
   [server.py:50-53](src/lemegeton/server.py#L50-L53)：先 bind port 0 取號再關閉，真正 bind 之前該 port 可能被別的程序搶走。
 
-- [ ] **`ActionServer` 關閉流程未持鎖遍歷 `active_tasks`**
-  [server.py:443-448](src/lemegeton/server.py#L443-L448)：worker 完成時會刪除自己的 key（[server.py:540-542](src/lemegeton/server.py#L540-L542)），關閉時的迭代可能 `KeyError` 或 `RuntimeError: dictionary changed size during iteration`。
+- [x] ✅ **`ActionServer` 關閉流程未持鎖遍歷 `active_tasks`**
+  worker 完成時會刪除自己的 key，關閉時的迭代可能 `KeyError` 或 `RuntimeError: dictionary changed size during iteration`。
+  **已修正**：收尾邏輯整段從 `_listener_loop` 移到 `close()`，並在 `tasks_lock` 內先做一份快照再遍歷。
 
-- [ ] **`ActionServer.close()` 先關 feedback publisher，仍在執行的 worker 會噴錯**
-  [server.py:390-395](src/lemegeton/server.py#L390-L395)：`_listener_loop` 結束後才 join worker，但 `_feedback_pub.close()` 與 worker 的 `send_feedback` 沒有順序保證。
+- [x] ✅ **`ActionServer.close()` 先關 feedback publisher，仍在執行的 worker 會噴錯**
+  原本 `_listener_loop` 結束後才 join worker，而 `close()` 又同時去關 `_feedback_pub`，兩者沒有順序保證；join 逾時的 worker 之後送 feedback 會撞到已關閉的 socket。
+  **已修正**：關閉順序固定為「停止收單 → 通知並等 worker 收尾（此時 publisher 與 goal socket 都還活著，worker 能正常送出最後的 feedback 與 RESULT）→ 才關閉 publisher 與 socket」。另加三道保護：`close()` 冪等（重複呼叫不再因 socket 已關閉而拋 `ZMQError`）、`close(timeout=...)` 可指定等待上限且 join 全部有界、`_pub_feedback` 與 `_worker_launcher` 在資源已關閉時優雅丟棄並記錄而非拋例外。
+  順帶讓 `HeartbeatClient.stop()` 冪等，涵蓋所有服務型別重複 `close()` 的情況。
 
 - [ ] **feedback Publisher 使用 `SNDHWM = 0`（無上限）**
   [server.py:372-378](src/lemegeton/server.py#L372-L378)：沒有訂閱者時佇列會無限成長，長時間執行有記憶體耗盡風險。
@@ -146,18 +149,38 @@
 - [ ] **`client.Publisher.send` / `Requester.send` 無鎖**
   多執行緒呼叫同一個 client 物件即為未定義行為；`Requester` 另有「`send` 與心跳線程同時觸發 `_init_socket`」的競爭（[client.py:142-154](src/lemegeton/client.py#L142-L154)）。
 
-- [ ] **`ShmReader` 建構失敗只印訊息不拋例外**
+- [ ] ⭐ **導入 blob 大型 payload 傳遞，並移除 `shm_util`** —— 設計與完整測試報告見 [docs/blob-vs-shm.md](docs/blob-vs-shm.md)
+  影像走 protobuf 的 `bytes` 欄位，會產生三次數 MB 的配置與複製（1080p 端到端 4.24ms、4K 22.37ms）。改成「protobuf 只放 header，像素接在同一個 frame 尾端」後，1080p 降到 0.93ms、巢狀情境實測快 3.8 倍，且 schema 完全保留、`CONFLATE` 不用動。
+  **同時證實 `shm_util` 已無存在價值**：把 protobuf 的 bytes 包裝拿掉後，ZMQ ipc 與共享記憶體在 4K 只差 0.03ms、1080p 差 0.19ms（原因是現有 shm 實作並非零複製，本身就有兩次 `np.copyto`）。
+  待辦步驟：
+  1. 實作 `msg/common/blob.proto` + `blob.py`（`pack`/`unpack`/`is_blob`）
+  2. `Publisher.send(message, blobs=None)`、`Subscriber(unpack_blobs=False)`、`serializer.decode_payload()`
+  3. `pyproject.toml` 新增 optional extra `array = ["numpy"]`
+  4. 影像發布端改用 blob，量測實際相機解析度與幀率確認夠用
+  5. 移除 `shm_util` 與 README 相關段落，並連帶關閉下方三個 shm 項目
+  6. README 補上「`CONFLATE` 與 multipart 不相容」的注意事項
+
+- [ ] ⚠️ **`CONFLATE` 與 multipart 不相容，會靜默破壞資料**（實測確認）
+  `CONFLATE=1` 把每個 frame 當成獨立訊息各自 conflate，multipart 的分組被摧毀 —— 送 20 則各 3 frame 的訊息，收端只拿到 **1 則、且只有最後一個 frame**。
+  **現有的地雷**：`ActionServer` 的 feedback publisher 送的是 multipart，且以 `{name}_feedback` 正常註冊到 gateway。`ActionFeedbackSubscriber` 沒開 CONFLATE 所以沒事，但使用者若拿一般的 `client.Subscriber` 去訂閱那個名稱（完全合法，因為它就註冊在那裡），由於 `client.Subscriber` 寫死 `CONFLATE=1`，必然收到殘缺的單一 frame。
+  **建議**：讓 `Subscriber` 的 CONFLATE 可設定，並在 README 標明。順帶記錄：`SNDHWM`/`RCVHWM` 與 multipart **相容**（以訊息則數計算，實測 `SNDHWM=5` 時不論每則幾個 frame 都剛好卡在 5 則），這點常被誤解。
+
+- [ ] **`ShmReader` 建構失敗只印訊息不拋例外**（若採用 blob 方案則隨 `shm_util` 一併移除）
   [shm_util.py:127-129](src/lemegeton/shm_util.py#L127-L129)：留下半初始化物件，之後 `get_data()` 只會靜默回傳 `None`，問題難以追查。
 
-- [ ] **共享記憶體沒有版本號，讀者可能讀到寫到一半的緩衝**
+- [ ] **共享記憶體沒有版本號，讀者可能讀到寫到一半的緩衝**（同上）
   [shm_util.py:35-36](src/lemegeton/shm_util.py#L35-L36)（原始碼已有 `# Todo: id check`）：三緩衝可降低但無法消除撕裂讀取；建議每個緩衝加上寫入序號，讀完再比對一次。
 
-- [ ] **`ShmReader` 依賴 CPython 私有 API**
+- [ ] **`ShmReader` 依賴 CPython 私有 API**（同上）
   [shm_util.py:120-125](src/lemegeton/shm_util.py#L120-L125)：`resource_tracker.unregister` 與 `SharedMemory._name` 非公開介面，Python 版本升級可能失效。另 `get_metadata` 用 `self.data_type.__name__`（[shm_util.py:65](src/lemegeton/shm_util.py#L65)），傳入 `np.dtype(...)` 實例時會壞掉，只支援 type 物件。
 
 ---
 
 ## P2 — 專案、建置與工具
+
+- [ ] **使用者 proto 互相 import 會產生錯不到的模組路徑**（實測確認）
+  `compile_protos.sh` 用 `-I$PROTO_SRC`（即 `-Imsg`），descriptor 路徑相對於 `msg/`，但輸出卻放進 `lemegeton/msg/...` 這個 package，兩者對不起來。使用者 proto 引用**內建** proto 沒問題（那條路徑本來就是 `lemegeton/msg/...`），但**使用者 proto 引用另一個使用者 proto** 就會壞掉 —— 例如 `import "teleop/teleop.proto"` 產生的是 `from teleop import teleop_pb2`，而安裝後的模組其實在 `lemegeton.msg.teleop.teleop_pb2`。
+  目前 repo 裡剛好沒有這種引用，屬潛伏問題。**建議**：讓使用者 proto 的 include 路徑與輸出 package 一致（例如一律以 `lemegeton/msg/` 為根）。
 
 - [ ] **`compile_protos.sh` 編譯失敗仍回傳成功（已實測確認）**
   [compile_protos.sh:21-36](src/lemegeton/compile_protos.sh#L21-L36)：`find | while read` 讓迴圈跑在子 shell，裡面的 `exit 1` 只結束子 shell，腳本仍以 rc=0 結束。實測：子 shell 回 1，但腳本最終 `rc=0`。
@@ -263,6 +286,9 @@
 | T8 `kill -9` 後同名重啟（部署版） | 重試 9 次、**18.0s** 才接管，離 25s 上限只剩 7s | ✅ **0.0s** 立即接管；服務仍活著時同名註冊照樣被拒 |
 | T9 移除 Redis 後的全套驗證（`--network none` 隔離容器） | — | ✅ gateway 無外部相依即可啟動；殺掉再重啟後服務 **6.5s** 靠心跳自行重新註冊；停機期間既有連線不受影響 |
 | T10 隔離環境崩潰接管（`mode="both"`，tcp + ipc 雙探測） | — | ✅ 活著時拒絕、崩潰後 0.0s 接管、新服務順利綁到自己的 port（探測未留殘影） |
+| T11 feedback 完整性（callback 每筆 40ms，RESULT 緊接最後一筆之後） | 每個任務 3 筆只收到 **1 筆**（6/18） | ✅ **18/18**，且沒有任何 feedback 落在 `result_callback` 之後 |
+| T11 關閉與資源回收（worker 活得比 close timeout 久） | `close()` 重複呼叫 → `ZMQError: Socket operation on non-socket` | ✅ 冪等、worker 全數收尾、關閉後的 feedback 優雅丟棄 |
+| T12 跨版本相容（feedback 加 seq、RESULT 加總數） | — | ✅ 新 server + 舊 client、舊 server + 新 client 都 `SUCCEEDED` 且收到 3 筆 feedback |
 
 > 上表「修正後」欄位自 T5 起皆為重建映像後的**部署版本**實測（未掛 `PYTHONPATH`）。
 > T1、T2 已於同一版本複測通過，確認 gateway 註冊路徑的改動沒有造成回歸。

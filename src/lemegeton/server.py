@@ -322,6 +322,13 @@ class ActionGoal:
         self._feedback_class = feedback_class
         self._feedback_callback = feedback_callback
         self._cancel_event = cancel_event
+        # feedback 的流水號，會隨 RESULT 一起回傳，讓 Client 知道自己收齊了沒有
+        self._feedback_seq = 0
+
+    @property
+    def feedback_seq(self) -> int:
+        """目前為止送出的 feedback 筆數"""
+        return self._feedback_seq
 
     def send_feedback(self, feedback_data: Any):
         if not isinstance(feedback_data, self._feedback_class):
@@ -329,8 +336,9 @@ class ActionGoal:
                 f"Warning: Wrong feedback class, expect: {self._feedback_class.__name__}"
             )
             return
-        # 格式：[Goal_ID, 序列化後的 Feedback]
-        self._feedback_callback(self.goal_id, feedback_data)
+        self._feedback_seq += 1
+        # 格式：[Goal_ID, 序列化後的 Feedback, 流水號]
+        self._feedback_callback(self.goal_id, feedback_data, self._feedback_seq)
 
     def is_canceled(self) -> bool:
         """檢查 Client 是否發出了取消請求"""
@@ -371,6 +379,8 @@ class ActionServer(ServiceCore):
         self._execute_callback = callback
         self._accept_thread = None
         self._close_timeout = 5.0  # 關閉時等待 Worker 結束的最大時間
+        self._closed = False  # close() 的冪等保護
+        self._feedback_closed = False  # feedback publisher 是否已關閉
 
         # 1. 初始化 ROUTER Socket
         self._goal_socket = context.socket(zmq.ROUTER)
@@ -411,12 +421,50 @@ class ActionServer(ServiceCore):
         self._accept_thread.start()
         print(f"[{self._name}] Action Server started successfully.")
 
-    def close(self):
+    def close(self, timeout: Optional[float] = None):
+        """關閉順序：停止收單 → 等 worker 收尾 → 才關閉 feedback publisher 與 socket。
+
+        先前是在 listener 迴圈裡收尾，而 close() 又同時去關 feedback publisher，
+        導致還在跑的 worker 送 feedback 時會撞到已關閉的 socket。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        timeout = self._close_timeout if timeout is None else timeout
+
+        # 1. 停止收單
         self._stop_event.set()
         if self._accept_thread:
-            self._accept_thread.join()
+            self._accept_thread.join(timeout=timeout)
 
+        # 2. 通知所有 worker 取消並等它們收尾。
+        #    此時 feedback publisher 與 goal socket 都還活著，
+        #    worker 仍可以正常送出最後的 feedback 與 RESULT。
+        with self.tasks_lock:
+            tasks = list(self.active_tasks.items())
+        for _, task in tasks:
+            task["cancel_event"].set()
+        for goal_id, task in tasks:
+            worker = task.get("worker")
+            if worker is not None:
+                worker.join(timeout=timeout)
+                if worker.is_alive():
+                    print(
+                        f"[{self._name}] Goal {goal_id} 的 worker 未在 {timeout}s 內結束"
+                    )
+
+        # 3. worker 都收乾淨了，才關閉對外資源
+        with self._feedback_pub_lock:
+            self._feedback_closed = True
         self._feedback_pub.close()
+
+        if getattr(self, "_heartbeat_client", None):
+            self._heartbeat_client.stop()
+
+        with self._socket_lock:
+            if self._goal_socket is not None:
+                self._goal_socket.close(linger=0)
+                self._goal_socket = None
 
     def _listener_loop(self):
         """ROUTER 監聽迴圈：只負責收單與分發"""
@@ -464,20 +512,9 @@ class ActionServer(ServiceCore):
             except Exception as e:
                 print(f"[{self._name}] Unexpected error in listener: {e}")
 
-        # 發送取消信號給所有 Worker，並等待它們結束
-        task_ids = list(self.active_tasks.keys())
-        for task_id in task_ids:
-            if task_id in self.active_tasks:
-                self.active_tasks[task_id]["cancel_event"].set()
-                self.active_tasks[task_id]["worker"].join(timeout=self._close_timeout)
-
-        # 關閉處理
-        if hasattr(self, "_heartbeat_client") and self._heartbeat_client:
-            self._heartbeat_client.stop()
-
-        with self._socket_lock:
-            if self._goal_socket:
-                self._goal_socket.close(linger=0)
+        # 收尾統一交給 close() 處理：這裡若自行遍歷 active_tasks 會與
+        # worker 完成時的刪除動作競爭（KeyError / dict changed size），
+        # 且關閉順序也無法與 close() 的 feedback publisher 協調。
 
     def _handle_new_goal(self, routing_id: bytes, goal_id: str, goal_data: Any):
         """收到新任務：建立取消訊號，並交給獨立的 Worker 線程處理"""
@@ -503,14 +540,21 @@ class ActionServer(ServiceCore):
             if goal_id in self.active_tasks:
                 self.active_tasks[goal_id]["cancel_event"].set()
 
-    def _pub_feedback(self, goal_id: str, feedback_data: Any):
+    def _pub_feedback(self, goal_id: str, feedback_data: Any, seq: int):
         with self._feedback_pub_lock:
-            self._feedback_pub.send_multipart(
-                [
-                    goal_id.encode("utf-8"),
-                    ProtobufMessageHandler.serialize(feedback_data),
-                ]
-            )
+            if self._feedback_closed:
+                print(f"[{self._name}] Feedback publisher 已關閉，丟棄 {goal_id} 的進度")
+                return
+            try:
+                self._feedback_pub.send_multipart(
+                    [
+                        goal_id.encode("utf-8"),
+                        ProtobufMessageHandler.serialize(feedback_data),
+                        str(seq).encode("utf-8"),
+                    ]
+                )
+            except zmq.ZMQError as e:
+                print(f"[{self._name}] Failed to publish feedback: {e}")
 
     def _worker_launcher(
         self,
@@ -545,18 +589,25 @@ class ActionServer(ServiceCore):
 
         # 透過 ROUTER 回傳結果
         # 💡 關鍵修正：發送時必須進 Lock，防止與 listener_loop 衝突
+        # 最後一個 frame 是 feedback 的總筆數，讓 Client 判斷自己收齊了沒有
         try:
             with self._socket_lock:
-                self._goal_socket.send_multipart(
-                    [
-                        routing_id,
-                        b"",
-                        b"RESULT",
-                        goal_id.encode("utf-8"),
-                        status_str.encode("utf-8"),
-                        ProtobufMessageHandler.serialize(result_data),
-                    ]
-                )
+                if self._goal_socket is None:
+                    print(
+                        f"[{self._name}] Server 已關閉，goal {goal_id} 的結果無法送出"
+                    )
+                else:
+                    self._goal_socket.send_multipart(
+                        [
+                            routing_id,
+                            b"",
+                            b"RESULT",
+                            goal_id.encode("utf-8"),
+                            status_str.encode("utf-8"),
+                            ProtobufMessageHandler.serialize(result_data),
+                            str(goal_handle.feedback_seq).encode("utf-8"),
+                        ]
+                    )
         except zmq.ZMQError as e:
             print(f"[{self._name}] Failed to send result to client: {e}")
 

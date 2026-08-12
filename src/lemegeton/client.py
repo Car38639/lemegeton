@@ -1,4 +1,5 @@
 import threading
+import time
 import uuid
 from concurrent.futures import Future
 from typing import Any, Dict, Optional
@@ -465,14 +466,18 @@ class ActionFeedbackSubscriber(ClientCore):
             print(f"[{self._name}] Goal {goal_id} is already being tracked.")
             return
         with self.goals_lock:
-            self.active_goals[goal_id] = {"callback": feedback_callback}
-            # self._socket.setsockopt_string(zmq.SUBSCRIBE, goal_id)
+            self.active_goals[goal_id] = {"callback": feedback_callback, "seq": 0}
 
     def untrack_goal(self, goal_id: str):
         with self.goals_lock:
             if goal_id in self.active_goals:
-                # self._socket.setsockopt_string(zmq.UNSUBSCRIBE, goal_id)
                 del self.active_goals[goal_id]
+
+    def received_seq(self, goal_id: str) -> int:
+        """已經交給使用者 callback 的 feedback 筆數（用來和 RESULT 的總數比對）"""
+        with self.goals_lock:
+            entry = self.active_goals.get(goal_id)
+            return entry["seq"] if entry else 0
 
     def _subscribe_process(self):
         waiting_logged = False
@@ -489,7 +494,8 @@ class ActionFeedbackSubscriber(ClientCore):
                         continue
                     waiting_logged = False
 
-                # SUB 接收格式：[goal_id, feedback_payload]
+                # SUB 接收格式：[goal_id, feedback_payload, seq]
+                # seq 是舊版 server 沒有的第三個 frame，缺少時就用本地計數遞增
                 frames = self._socket.recv_multipart()
                 if len(frames) < 2:
                     print(
@@ -498,20 +504,27 @@ class ActionFeedbackSubscriber(ClientCore):
                     continue
 
                 goal_id = frames[0].decode("utf-8")
+                seq = None
+                if len(frames) >= 3:
+                    try:
+                        seq = int(frames[2])
+                    except ValueError:
+                        seq = None
 
                 with self.goals_lock:
-                    if (
-                        goal_id in self.active_goals
-                        and self.active_goals[goal_id]["callback"]
-                    ):
+                    entry = self.active_goals.get(goal_id)
+                    if entry and entry["callback"]:
                         feedback = ProtobufMessageHandler.deserialize(
                             self._feedback_class, frames[1]
                         )
-                        self.active_goals[goal_id]["callback"](feedback)
+                        try:
+                            entry["callback"](feedback)
+                        finally:
+                            # 先交給使用者 callback 再計數，這樣「收齊」就等於
+                            # 「所有 feedback 都已經送到使用者手上」
+                            entry["seq"] = seq if seq is not None else entry["seq"] + 1
                     else:
-                        # print(
-                        #     f"[{self._name}] Received feedback for untracked goal {goal_id}. Ignoring."
-                        # )
+                        # 不在追蹤中的 goal，忽略
                         pass
 
             except zmq.Again:
@@ -556,6 +569,7 @@ class ActionClient(ClientCore):
         ip_address: str = "localhost",
         timeout: float = 30.0,
         connect_timeout: float = 5.0,
+        feedback_grace: float = 0.3,
         query_port: Optional[int] = Gateway.DEFAULT_QUERY_PORT,
         heartbeat_interval: float = CLIENT_HEARTBEAT_INTERVAL,
         heartbeat_timeout: float = CLIENT_HEARTBEAT_TIMEOUT,
@@ -575,6 +589,8 @@ class ActionClient(ClientCore):
         self._heartbeat_timeout = heartbeat_timeout
         self._timeout = timeout
         self._connect_timeout = connect_timeout
+        # 收到 RESULT 後，最多再等這麼久讓晚到的 feedback 補齊
+        self._feedback_grace = feedback_grace
         self._goal_class = goal_class
         self._feedback_class = feedback_class
         self._result_class = result_class
@@ -717,6 +733,30 @@ class ActionClient(ClientCore):
                 [b"", b"CANCEL", goal_id.encode("utf-8")]
             )
 
+    def _await_final_feedback(self, goal_id: str, expected_seq: int):
+        """RESULT 走 DEALER、feedback 走 SUB，是兩條獨立通道，最後一筆 feedback
+        很容易比 RESULT 晚到。這裡在完成 Future 之前短暫等它補齊，確保
+        「所有進度都送到使用者手上」才觸發 result_callback。
+
+        expected_seq 為 0 代表對方是舊版 server（沒有這個欄位）或本來就沒有
+        feedback，此時直接返回不等待。
+        """
+        if expected_seq <= 0 or self._feedback_grace <= 0:
+            return
+
+        deadline = time.monotonic() + self._feedback_grace
+        while time.monotonic() < deadline:
+            if self._feedback_subscriber.received_seq(goal_id) >= expected_seq:
+                return
+            time.sleep(0.005)
+
+        missing = expected_seq - self._feedback_subscriber.received_seq(goal_id)
+        if missing > 0:
+            print(
+                f"[{self._name} Client] Goal {goal_id} 有 {missing} 筆 feedback "
+                f"在 {self._feedback_grace}s 內未送達，可能已遺失"
+            )
+
     def _result_listener_loop(self):
         """監聽 DEALER Socket 回傳的最終任務結果"""
         while not self._stop_event.is_set():
@@ -749,10 +789,19 @@ class ActionClient(ClientCore):
                     result = ProtobufMessageHandler.deserialize(
                         self._result_class, frames[4]
                     )
+                    # 第 6 個 frame 是 server 送出的 feedback 總筆數（舊版沒有）
+                    expected_seq = 0
+                    if len(frames) >= 6:
+                        try:
+                            expected_seq = int(frames[5])
+                        except ValueError:
+                            expected_seq = 0
+
                     with self.goals_lock:
                         entry = self.active_goals.pop(goal_id, None)
 
                     if entry is not None:
+                        self._await_final_feedback(goal_id, expected_seq)
                         # 解除 SUB Socket 對該任務的追蹤，釋放資源
                         self._feedback_subscriber.untrack_goal(goal_id)
                         # set_result 會同步觸發使用者的 result_callback，

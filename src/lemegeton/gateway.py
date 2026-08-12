@@ -433,6 +433,11 @@ class HeartbeatClient:
                 time.sleep(0.1)  # 避免忙等
 
     def stop(self):
+        # 冪等：重複呼叫時第二次的 send_json 會撞到已關閉的 socket
+        if getattr(self, "_stopped", False):
+            return
+        self._stopped = True
+
         self._heartbeat_event.set()
         if self._heartbeat_thread.is_alive():
             self._heartbeat_thread.join()
