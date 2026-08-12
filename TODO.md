@@ -5,8 +5,8 @@
 
 | 分類 | 數量 | 已修正 |
 | --- | --- | --- |
-| P0 正確性錯誤 | 10 | 5 |
-| P1 穩健性 / 資源管理 | 19 | 0 |
+| P0 正確性錯誤 | 10 | 8 |
+| P1 穩健性 / 資源管理 | 19 | 2 |
 | P2 專案 / 建置 / 工具 | 10 | 0 |
 | 安全性與部署風險 | 7 | 0 |
 | 部署與版本落差 | 2 | 2 |
@@ -24,15 +24,15 @@
 
 ## P0 — 正確性錯誤（會當機、掛死或送出錯誤資料）
 
-- [ ] ⚠️ **Client 在尚未取得 endpoint 時就 `connect(None)`，建構子直接失敗**
-  [client.py:293-294](src/lemegeton/client.py#L293-L294)、[client.py:388-389](src/lemegeton/client.py#L388-L389)、[client.py:525-532](src/lemegeton/client.py#L525-L532)
-  `Subscriber` / `ActionFeedbackSubscriber` / `ActionClient` 只 `time.sleep(0.5~1.0)` 就呼叫 `_init_socket()`，其中 `self._socket.connect(self._endpoint)` 在 Gateway 未啟動、服務尚未註冊或網路稍慢時 `self._endpoint` 仍是 `None` → 例外。
-  **建議**：改成等待 endpoint 的重試迴圈（帶總逾時），或延後到第一次收送時再建立 socket（與 `Requester` 的作法一致）。
+- [x] ✅ ⚠️ **Client 在尚未取得 endpoint 時就 `connect(None)`，建構子直接失敗**
+  [client.py](src/lemegeton/client.py)
+  `Subscriber` / `ActionFeedbackSubscriber` / `ActionClient` 只 `time.sleep(0.5~1.0)` 就呼叫 `_init_socket()`，其中 `self._socket.connect(self._endpoint)` 在 Gateway 未啟動、服務尚未註冊或網路稍慢時 `self._endpoint` 仍是 `None` → 例外（實測舊版：`TypeError: expected bytes, NoneType found`）。
+  **已修正**：`ClientCore` 新增 `_endpoint_ready` 事件與 `wait_for_endpoint(timeout)`，建構子改為「等待」而非盲目 sleep（新增 `connect_timeout` 參數，預設 5 秒）；所有 `_init_socket()` 改為回傳 bool，endpoint 未就緒時不建 socket，收送迴圈會持續等服務上線後自動連上。等不到也不再讓建構子失敗。
 
-- [ ] ⚠️ **`ActionClient` 結果幀長度檢查 off-by-one，導致結果線程無聲死亡**
-  [client.py:641-650](src/lemegeton/client.py#L641-L650)
-  收到的幀是 `[b"", b"RESULT", goal_id, status, payload]`（5 幀），但檢查為 `if len(frames) < 4: continue`，之後卻存取 `frames[4]`。剛好 4 幀時 `IndexError`，而該迴圈只捕捉 `zmq.ZMQError` → 線程直接結束，`Future` 永遠不會完成、dealer socket 與 feedback subscriber 也不會被關閉。
-  **建議**：改為 `< 5`，並補上 broad `except Exception` 記錄後續續跑。
+- [x] ✅ ⚠️ **`ActionClient` 結果幀長度檢查 off-by-one，導致結果線程無聲死亡**
+  [client.py](src/lemegeton/client.py)
+  收到的幀是 `[b"", b"RESULT", goal_id, status, payload]`（5 幀），但檢查為 `if len(frames) < 4: continue`，之後卻存取 `frames[4]`。剛好 4 幀時 `IndexError`，而該迴圈只捕捉 `zmq.ZMQError` → 線程直接結束，`Future` 永遠不會完成。
+  **已修正**：改為 `< 5`，並把 `except zmq.ZMQError: break` 換成 ContextTerminated / ZMQError / Exception 三段處理，單筆訊息處理失敗不再讓整條 listener 消失。
 
 - [x] ✅ ⚠️ **`Responder` 反序列化失敗時回傳錯誤型別**
   [server.py:97-150](src/lemegeton/server.py#L97-L150)
@@ -59,10 +59,11 @@
   只處理 `self._enable_tcp`，但 `ServiceCore` 仍會把 ipc endpoint 註冊到 Gateway，Client 於是連到一個不存在的位址（且 `localhost` 情況下 Client 會優先選 ipc，見 [client.py:47-52](src/lemegeton/client.py#L47-L52)）。
   **建議**：補上 ipc bind，或在 `ActionServer` 明確拒絕 `ipc`/`both`。
 
-- [ ] ⚠️ **`ActionClient` 的 DEALER socket 被兩個執行緒同時使用**
-  [client.py:586](src/lemegeton/client.py#L586)、[client.py:624](src/lemegeton/client.py#L624)、[client.py:636-640](src/lemegeton/client.py#L636-L640)
+- [x] ✅ ⚠️ **`ActionClient` 的 DEALER socket 被兩個執行緒同時使用**
+  [client.py](src/lemegeton/client.py)
   `send_goal` / `cancel_goal` 在使用者執行緒送，`_result_listener_loop` 在背景執行緒收。ZMQ socket 非執行緒安全，會出現偶發的當機或幀錯亂。Server 端已用 `_socket_lock` 保護（[server.py:362](src/lemegeton/server.py#L362)），Client 端漏了。
-  **建議**：加上同一把 `threading.Lock`，或改由單一線程持有 socket（inproc queue 轉送）。
+  **已修正**：新增 `_dealer_lock`（RLock），`send_goal` / `cancel_goal` / listener 的 poll+recv 全部序列化；listener 改用 20ms 短 poll 並在鎖外讓出，避免餓死送出端。DEALER 也改為由 `_ensure_dealer()` 延遲建立/重建，endpoint 未就緒時 `send_goal` 拋 `ConnectionError` 而不是操作 `None`。
+  順帶修掉一個潛在死鎖：`future.set_result()` 原本在 `goals_lock` 內呼叫，而它會同步觸發使用者的 `result_callback`，callback 裡若再 `send_goal` 就會卡死；現改為在鎖外設值。
 
 - [ ] ⚠️ **心跳的名稱衝突偵測失效（狀態碼對不上）**
   Gateway 心跳回應的是 `MISMATCH`（[gateway.py:184-213](src/lemegeton/gateway.py#L184-L213)），但 `HeartbeatClient` 只檢查 `ALREADY_EXISTS`（[gateway.py:353](src/lemegeton/gateway.py#L353)）。結果：同名服務被搶註後仍持續心跳、不會自我停止，兩個服務互相覆寫註冊資訊。
@@ -76,11 +77,14 @@
 
 ## P1 — 穩健性、資源管理與併發
 
-- [ ] **Client 心跳線程遇到任意例外就永久終止**
-  [client.py:101-103](src/lemegeton/client.py#L101-L103)：`except Exception: break` → 之後再也不會重新查詢 endpoint，服務重啟後無法自動重連（與框架主打的「自動重連」相違）。
+- [x] ✅ **Client 心跳線程遇到任意例外就永久終止**
+  [client.py](src/lemegeton/client.py)：`except Exception: break` → 之後再也不會重新查詢 endpoint。
+  **根因比表面更嚴重**：心跳的 REQ socket 沒有設 `REQ_RELAXED`，Gateway 一逾時就卡在「等待回覆」狀態，下一輪 `send` 直接 `EFSM` → 落入 broad except → 線程死亡。實測舊版把 `query_port` 指向沒人在聽的埠，**2 秒**就出現 `Heartbeat error: Operation cannot be accomplished in current state` 並終止。
+  **已修正**：心跳 socket 補上 `REQ_RELAXED` / `REQ_CORRELATE`；`zmq.Again` 視為 gateway 暫時不可達（保留最後已知 endpoint 繼續運作）；其他例外改為重建 socket 後重試，只有 `ContextTerminated` 才結束線程。另把 `time.sleep` 換成 `_heartbeat_stop_event.wait()`，`close()` 不必再等滿一個心跳週期。
 
-- [ ] **`ActionClient.close()` 沒有呼叫 `super().close()`**
-  [client.py:668-674](src/lemegeton/client.py#L668-L674)：心跳線程與心跳 socket 洩漏。另外若在 `_init_sockets()` 之前呼叫 `close()`，`self._stop_event` 尚未建立 → `AttributeError`。
+- [x] ✅ **`ActionClient.close()` 沒有呼叫 `super().close()`**
+  [client.py](src/lemegeton/client.py)：心跳線程與心跳 socket 洩漏；且在 `_init_sockets()` 之前呼叫 `close()` 會因 `self._stop_event` 未建立而 `AttributeError`。
+  **已修正**：`close()` 補上 `super().close()`；`_stop_event` / `dealer_socket` / `_dealer_lock` 改在 `__init__` 最前段就建立。
 
 - [ ] **Gateway 對 Redis 完全沒有錯誤處理**
   [gateway.py:93-101](src/lemegeton/gateway.py#L93-L101)、[gateway.py:236](src/lemegeton/gateway.py#L236)：Redis 斷線或逾時會讓 `run()` 整個拋出，Gateway 直接下線 → 所有服務失去尋址能力。建議 Redis 只當作備援快取，失敗時降級為純本地快取。
@@ -228,6 +232,15 @@
 | Responder callback 拋例外後續請求 | `boom→None`，之後 `ok2`/`ok3` 全部 `None`，服務永久失效 | ✅ `boom→""`，`ok2`/`ok3` 正常回覆 |
 | Action client 閒置 6 秒（feedback timeout 3 秒） | feedback / result 線程皆死亡，`send_goal` 拋 `Socket operation on non-socket` | ✅ 兩條線程存活，3/3 feedback + `SUCCEEDED` |
 | 服務 `kill -9` 後同名重啟（回填碼回歸測試） | — | ✅ 重試 9 次後於 18.0s 接管成功 |
+
+### Client 端連線競態（第二輪，於獨立容器對接同一座 gateway）
+
+| 測試 | 修正前 | 修正後 |
+| --- | --- | --- |
+| T1 服務尚未上線就建立 client | `TypeError: expected bytes, NoneType found`（`connect(None)`） | ✅ 可建構；未連線時 `send_goal` 拋 `ConnectionError`；服務上線後 Subscriber / ActionClient 自動接上 |
+| T2 8 執行緒併發 32 個 goal ＋ 8 次併發 cancel | DEALER 無鎖，行為未定義 | ✅ 32/32 完成（24 SUCCEEDED / 8 CANCELED），0 例外，1.7s |
+| T3 `docker restart lemegeton-gateway` | 心跳線程死亡，服務換 port 後永遠追不上 | ✅ 心跳/接收線程全存活；停機期間既有 PUB/SUB 不受影響；服務換 port 後 Requester `43961→44179`、Subscriber `42381→48067`，13.1s 內全部恢復 |
+| T4 gateway 不可達（query_port 指向空埠） | 2 秒後 `Heartbeat error: Operation cannot be accomplished in current state`，線程終止 | ✅ 持續重試，6 秒觀察期間線程恆存活 |
 
 > 同名重啟要等 **18 秒**才成功（重試上限 `2 × HEARTBEAT_RATE + 5 = 25` 秒），對需要快速重啟的服務
 > 偏長且離上限不遠。可考慮縮短 TTL 或提高心跳頻率，見上方 P1「服務崩潰後 20 秒內無法以同名重啟」。
