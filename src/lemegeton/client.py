@@ -7,7 +7,9 @@ from typing import Any, Dict, Optional
 import zmq
 
 from lemegeton.gateway import Gateway, GatewayStatus, ServiceType
-from lemegeton.serializer import ProtobufMessageHandler
+from lemegeton import blob
+from lemegeton.serializer import ProtobufMessageHandler, decode_payload
+from lemegeton.staging import to_message, to_payload
 
 CLIENT_HEARTBEAT_INTERVAL = 0.5  # seconds
 CLIENT_HEARTBEAT_TIMEOUT = 1.0  # seconds
@@ -30,18 +32,53 @@ class ClientCore:
         self._ip_address = ip_address
         self._query_port = query_port
         self._heartbeat_interval = heartbeat_interval
+        self._heartbeat_timeout = heartbeat_timeout
 
         self._endpoint = None
         self._reconnect_event = threading.Event()
+        # 取得 endpoint 後才會被設起來，讓建構流程可以「等待」而不是盲目 sleep
+        self._endpoint_ready = threading.Event()
+        self._gateway_reachable = True
 
-        self._heartbeat_sock = context.socket(zmq.REQ)
-        self._heartbeat_sock.setsockopt(zmq.RCVTIMEO, int(heartbeat_timeout * 1000))
-        self._heartbeat_sock.setsockopt(zmq.LINGER, 0)
-        self._heartbeat_sock.connect(f"tcp://{ip_address}:{self._query_port}")
+        self._heartbeat_sock = self._create_heartbeat_socket()
 
         self._heartbeat_stop_event = threading.Event()
         self._heartbeat_thread = threading.Thread(target=self._heartbeat, daemon=True)
         self._heartbeat_thread.start()
+
+    def _create_heartbeat_socket(self):
+        sock = self._context.socket(zmq.REQ)
+        sock.setsockopt(zmq.RCVTIMEO, int(self._heartbeat_timeout * 1000))
+        sock.setsockopt(zmq.LINGER, 0)
+        # Gateway 逾時或重啟後，REQ 會卡在「等待回覆」狀態，下一次 send 會直接 EFSM。
+        # RELAXED / CORRELATE 允許直接重送並自動丟棄遲到的舊回覆。
+        sock.setsockopt(zmq.REQ_RELAXED, 1)
+        sock.setsockopt(zmq.REQ_CORRELATE, 1)
+        sock.connect(f"tcp://{self._ip_address}:{self._query_port}")
+        return sock
+
+    def _reset_heartbeat_socket(self):
+        try:
+            self._heartbeat_sock.close(linger=0)
+        except Exception:
+            pass
+        self._heartbeat_sock = self._create_heartbeat_socket()
+
+    def _set_endpoint(self, endpoint: Optional[str]):
+        """統一 endpoint 的狀態轉換，順便維護 _endpoint_ready / _reconnect_event"""
+        if endpoint == self._endpoint:
+            return
+        if endpoint is None:
+            self._endpoint = None
+            self._endpoint_ready.clear()
+        else:
+            self._reconnect_event.set()
+            self._endpoint = endpoint
+            self._endpoint_ready.set()
+
+    def wait_for_endpoint(self, timeout: float) -> bool:
+        """等 gateway 回報 endpoint；逾時回傳 False，由呼叫端決定是否繼續。"""
+        return self._endpoint_ready.wait(timeout)
 
     def _heartbeat(self):
         def _get_endpoint(service_ip, service_info):
@@ -60,47 +97,41 @@ class ClientCore:
             try:
                 self._heartbeat_sock.send_json({"name": self._name})
                 resp = self._heartbeat_sock.recv_json()
-                if resp is None or resp.get("status") != GatewayStatus.FOUND.value:
-                    # print(
-                    #     f"[{self._name}] Service not found or inaccessible! Please ensure the service is running and the name is correct."
-                    # )
-                    self._endpoint = None
-                    time.sleep(self._heartbeat_interval)
-                    continue
-
-                elif (
-                    resp.get("data", {}).get("type") != self._expect_service_type.value
-                ):
-                    # print(
-                    #     f"[{self._name}] Service type mismatch! The service is {resp.get('data', {}).get('type')}, but expected {self._expect_service_type.value}."
-                    # )
-                    self._endpoint = None
-                    time.sleep(self._heartbeat_interval)
-                    continue
-
-                else:
-                    endpoint = _get_endpoint(self._ip_address, resp.get("data", {}))
-                    if endpoint is None:
-                        # print(
-                        #     f"[{self._name}] Service is not accessible for external client."
-                        # )
-                        self._endpoint = None
-
-                    elif endpoint != self._endpoint:
-                        # print(
-                        #     f"[{self._name}] Service endpoint changed: {self._endpoint} -> {endpoint}"
-                        # )
-                        self._reconnect_event.set()
-                        self._endpoint = endpoint
-                    time.sleep(self._heartbeat_interval)
-
             except zmq.Again:
-                print("Gateway query timeout. Retrying...")
+                # Gateway 沒回應（還沒啟動或正在重啟）：保留最後已知的 endpoint 繼續運作，
+                # 並繼續下一輪查詢。這裡若結束線程，gateway 回來之後就永遠不會再重連。
+                if self._gateway_reachable:
+                    print(f"[{self._name}] Gateway 無回應，持續重試中...")
+                    self._gateway_reachable = False
+                self._heartbeat_stop_event.wait(self._heartbeat_interval)
+                continue
             except zmq.ContextTerminated:
                 break
             except Exception as e:
+                # 非預期錯誤同樣不能讓線程死掉，重建 socket 後重試
                 print(f"[{self._name}] Heartbeat error: {e}")
-                break
+                self._reset_heartbeat_socket()
+                self._gateway_reachable = False
+                self._heartbeat_stop_event.wait(self._heartbeat_interval)
+                continue
+
+            if not self._gateway_reachable:
+                print(f"[{self._name}] Gateway 已恢復回應")
+                self._gateway_reachable = True
+
+            if resp is None or resp.get("status") != GatewayStatus.FOUND.value:
+                # 服務不存在或名稱錯誤
+                self._set_endpoint(None)
+            elif resp.get("data", {}).get("type") != self._expect_service_type.value:
+                # 名稱找到了但型別不符
+                self._set_endpoint(None)
+            else:
+                # _get_endpoint 回 None 代表該服務不對外提供（例如只開了 ipc）
+                self._set_endpoint(
+                    _get_endpoint(self._ip_address, resp.get("data", {}))
+                )
+
+            self._heartbeat_stop_event.wait(self._heartbeat_interval)
 
         self._heartbeat_sock.close(linger=0)
 
@@ -139,8 +170,12 @@ class Requester(ClientCore):
 
         self._socket = None
 
-    def _init_socket(self):
-        """初始化或重置 Socket 狀態"""
+    def _init_socket(self) -> bool:
+        """初始化或重置 Socket 狀態；endpoint 尚未取得時回傳 False"""
+        endpoint = self._endpoint
+        if endpoint is None:
+            return False
+
         if self._socket:
             self._socket.close(linger=0)
 
@@ -150,22 +185,22 @@ class Requester(ClientCore):
 
         self._socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
         self._socket.setsockopt(zmq.LINGER, 0)
-        self._socket.connect(self._endpoint)
+        self._socket.connect(endpoint)
         self._reconnect_event.clear()
+        return True
 
     def send(self, message):
+        message = to_message(message)
         if not isinstance(message, self._message_class):
             print(f"Warning: Expected {self._message_class.__name__}")
             return None
 
-        if self._endpoint is None:
-            print(
-                f"[{self._name}] No endpoint available. Please wait for the gateway to respond."
-            )
-            return None
-
-        elif self._reconnect_event.is_set():
-            self._init_socket()
+        if self._socket is None or self._reconnect_event.is_set():
+            if not self._init_socket():
+                print(
+                    f"[{self._name}] No endpoint available. Please wait for the gateway to respond."
+                )
+                return None
 
         try:
             message_bytes = ProtobufMessageHandler.serialize(message)
@@ -220,35 +255,44 @@ class Publisher(ClientCore):
 
         self._socket = None
 
-    def _init_socket(self):
-        """初始化或重置 Socket 狀態"""
+    def _init_socket(self) -> bool:
+        """初始化或重置 Socket 狀態；endpoint 尚未取得時回傳 False"""
+        endpoint = self._endpoint
+        if endpoint is None:
+            return False
+
         if self._socket:
             self._socket.close(linger=0)
 
         self._socket = self._context.socket(zmq.PUB)
         self._socket.setsockopt(zmq.LINGER, 0)
-        self._socket.connect(self._endpoint)
-        self._last_endpoint = self._endpoint
+        self._socket.connect(endpoint)
         self._reconnect_event.clear()
+        return True
 
-    def send(self, message):
+    def send(self, message, arrays=None):
+        """送出訊息。`arrays` 的用法與 :meth:`lemegeton.server.Publisher.send` 相同。"""
+        message, staged = to_payload(message)
+        if arrays:
+            staged = {**staged, **arrays}
         if not isinstance(message, self._message_class):
             print(
                 f"[{self._name}] Warning: Wrong message class, expect: {self._message_class.__name__}"
             )
             return
 
-        if self._endpoint is None:
-            print(
-                f"[{self._name}] No endpoint available. Please wait for the gateway to respond."
-            )
-            return
-        elif self._reconnect_event.is_set():
-            self._init_socket()
+        if self._socket is None or self._reconnect_event.is_set():
+            if not self._init_socket():
+                print(
+                    f"[{self._name}] No endpoint available. Please wait for the gateway to respond."
+                )
+                return
 
         try:
-            message_bytes = ProtobufMessageHandler.serialize(message)
-            self._socket.send(message_bytes)
+            if staged:
+                self._socket.send(blob.encode(message, staged), copy=False)
+            else:
+                self._socket.send(ProtobufMessageHandler.serialize(message))
         except Exception as e:
             print(f"[{self._name}] Error sending message: {e}")
 
@@ -271,6 +315,8 @@ class Subscriber(ClientCore):
         ip_address: str = "localhost",
         query_port: Optional[int] = Gateway.DEFAULT_QUERY_PORT,
         timeout: float = 30.0,
+        connect_timeout: float = 5.0,
+        unpack_blobs: bool = False,
         heartbeat_interval: float = CLIENT_HEARTBEAT_INTERVAL,
         heartbeat_timeout: float = CLIENT_HEARTBEAT_TIMEOUT,
     ):
@@ -285,45 +331,59 @@ class Subscriber(ClientCore):
         )
         self._message_class = message_class
         self._callback = callback
+        # True 時 callback 簽章為 (message, arrays)
+        self._unpack_blobs = unpack_blobs
         self._timeout = int(timeout * 1000)  # 轉換為毫秒
         self._sub_stop_event = threading.Event()
         self._sub_thread = None
 
         self._socket = None
-        time.sleep(0.5)  # 等待心跳確認服務狀態
-        self._init_socket()
+        # 等 gateway 回報 endpoint 再建 socket；等不到也不阻擋建構，
+        # 訂閱線程會持續等待服務上線（原本是盲目 sleep 0.5 秒後直接 connect(None)）
+        if not self.wait_for_endpoint(connect_timeout):
+            print(
+                f"[{self._name}] 尚未取得 endpoint（{connect_timeout}s），將在服務上線後自動連線"
+            )
 
         self._sub_thread = threading.Thread(target=self._subscribe_process, daemon=True)
         self._sub_thread.start()
 
-    def _init_socket(self):
-        """專門負責 Socket 的初始化與訂閱設定"""
+    def _init_socket(self) -> bool:
+        """專門負責 Socket 的初始化與訂閱設定；endpoint 未就緒時回傳 False"""
+        endpoint = self._endpoint
+        if endpoint is None:
+            return False
+
         if self._socket:
             self._socket.close(linger=0)
         self._socket = self._context.socket(zmq.SUB)
         self._socket.setsockopt(zmq.RCVTIMEO, self._timeout)
         self._socket.setsockopt(zmq.CONFLATE, 1)
         self._socket.setsockopt(zmq.LINGER, 0)  # 防止關閉時卡住
-        self._socket.connect(self._endpoint)
+        self._socket.connect(endpoint)
         self._socket.setsockopt_string(zmq.SUBSCRIBE, "")
         self._reconnect_event.clear()
+        return True
 
     def _subscribe_process(self):
+        waiting_logged = False
         while not self._sub_stop_event.is_set():
             try:
-                if self._endpoint is None:
-                    print(
-                        f"[{self._name}] No endpoint available. Waiting for the gateway to respond......"
-                    )
-                    time.sleep(0.5)
-                    continue
-                elif self._reconnect_event.is_set():
-                    self._init_socket()
+                if self._socket is None or self._reconnect_event.is_set():
+                    if not self._init_socket():
+                        if not waiting_logged:
+                            print(
+                                f"[{self._name}] No endpoint available. Waiting for the gateway to respond......"
+                            )
+                            waiting_logged = True
+                        self._sub_stop_event.wait(0.5)
+                        continue
+                    waiting_logged = False
 
                 # 2. 接收與反序列化
                 message_bytes = self._socket.recv()
-                message = ProtobufMessageHandler.deserialize(
-                    self._message_class, message_bytes
+                args = decode_payload(
+                    message_bytes, self._message_class, self._unpack_blobs
                 )
             except zmq.Again:
                 continue
@@ -336,7 +396,7 @@ class Subscriber(ClientCore):
                 continue
 
             try:
-                self._callback(message)
+                self._callback(*args)
             except Exception as e:
                 print(f"[{self._name}] Callback execution error: {e}")
 
@@ -364,6 +424,7 @@ class ActionFeedbackSubscriber(ClientCore):
         ip_address: str = "localhost",
         query_port: Optional[int] = Gateway.DEFAULT_QUERY_PORT,
         timeout: float = 30.0,
+        connect_timeout: float = 5.0,
         heartbeat_interval: float = CLIENT_HEARTBEAT_INTERVAL,
         heartbeat_timeout: float = CLIENT_HEARTBEAT_TIMEOUT,
     ):
@@ -385,57 +446,68 @@ class ActionFeedbackSubscriber(ClientCore):
         self._socket = None
         self._timeout_flag = timeout_flag
 
-        time.sleep(0.5)  # 等待心跳確認服務狀態
-        self._init_socket()
+        # 等 gateway 回報 endpoint 再建 socket（原本盲目 sleep 0.5 秒後 connect(None)）
+        if not self.wait_for_endpoint(connect_timeout):
+            print(
+                f"[{self._name}] 尚未取得 endpoint（{connect_timeout}s），將在服務上線後自動連線"
+            )
 
         self._sub_thread = threading.Thread(target=self._subscribe_process, daemon=True)
         self._sub_thread.start()
 
-    def _init_socket(self):
-        """專門負責 Socket 的初始化與訂閱設定"""
+    def _init_socket(self) -> bool:
+        """專門負責 Socket 的初始化與訂閱設定；endpoint 未就緒時回傳 False"""
+        endpoint = self._endpoint
+        if endpoint is None:
+            return False
+
         if self._socket:
             self._socket.close(linger=0)
         self._socket = self._context.socket(zmq.SUB)
         self._socket.setsockopt(zmq.RCVTIMEO, self._timeout)
         self._socket.setsockopt(zmq.RCVHWM, 0)
         self._socket.setsockopt(zmq.LINGER, 0)  # 防止關閉時卡住
-        self._socket.connect(self._endpoint)
+        self._socket.connect(endpoint)
         self._socket.setsockopt_string(zmq.SUBSCRIBE, "")
         self._reconnect_event.clear()
+        return True
 
     def track_goal(self, goal_id: str, feedback_callback: callable):
-        while self._socket is None:
-            print(
-                f"[{self._name}] Socket not initialized yet. Waiting before tracking goal {goal_id}..."
-            )
-            time.sleep(0.5)
-
+        # 只是登記 callback，不需要等 socket 就緒（訂閱是收全部再依 goal_id 過濾）
         if goal_id in self.active_goals:
             print(f"[{self._name}] Goal {goal_id} is already being tracked.")
             return
         with self.goals_lock:
-            self.active_goals[goal_id] = {"callback": feedback_callback}
-            # self._socket.setsockopt_string(zmq.SUBSCRIBE, goal_id)
+            self.active_goals[goal_id] = {"callback": feedback_callback, "seq": 0}
 
     def untrack_goal(self, goal_id: str):
         with self.goals_lock:
             if goal_id in self.active_goals:
-                # self._socket.setsockopt_string(zmq.UNSUBSCRIBE, goal_id)
                 del self.active_goals[goal_id]
 
+    def received_seq(self, goal_id: str) -> int:
+        """已經交給使用者 callback 的 feedback 筆數（用來和 RESULT 的總數比對）"""
+        with self.goals_lock:
+            entry = self.active_goals.get(goal_id)
+            return entry["seq"] if entry else 0
+
     def _subscribe_process(self):
+        waiting_logged = False
         while not self._sub_stop_event.is_set():
             try:
-                if self._endpoint is None:
-                    print(
-                        f"[{self._name}] No endpoint available. Waiting for the gateway to respond......"
-                    )
-                    time.sleep(0.5)
-                    continue
-                elif self._reconnect_event.is_set():
-                    self._init_socket()
+                if self._socket is None or self._reconnect_event.is_set():
+                    if not self._init_socket():
+                        if not waiting_logged:
+                            print(
+                                f"[{self._name}] No endpoint available. Waiting for the gateway to respond......"
+                            )
+                            waiting_logged = True
+                        self._sub_stop_event.wait(0.5)
+                        continue
+                    waiting_logged = False
 
-                # SUB 接收格式：[goal_id, feedback_payload]
+                # SUB 接收格式：[goal_id, feedback_payload, seq]
+                # seq 是舊版 server 沒有的第三個 frame，缺少時就用本地計數遞增
                 frames = self._socket.recv_multipart()
                 if len(frames) < 2:
                     print(
@@ -444,25 +516,33 @@ class ActionFeedbackSubscriber(ClientCore):
                     continue
 
                 goal_id = frames[0].decode("utf-8")
+                seq = None
+                if len(frames) >= 3:
+                    try:
+                        seq = int(frames[2])
+                    except ValueError:
+                        seq = None
 
                 with self.goals_lock:
-                    if (
-                        goal_id in self.active_goals
-                        and self.active_goals[goal_id]["callback"]
-                    ):
+                    entry = self.active_goals.get(goal_id)
+                    if entry and entry["callback"]:
                         feedback = ProtobufMessageHandler.deserialize(
                             self._feedback_class, frames[1]
                         )
-                        self.active_goals[goal_id]["callback"](feedback)
+                        try:
+                            entry["callback"](feedback)
+                        finally:
+                            # 先交給使用者 callback 再計數，這樣「收齊」就等於
+                            # 「所有 feedback 都已經送到使用者手上」
+                            entry["seq"] = seq if seq is not None else entry["seq"] + 1
                     else:
-                        # print(
-                        #     f"[{self._name}] Received feedback for untracked goal {goal_id}. Ignoring."
-                        # )
+                        # 不在追蹤中的 goal，忽略
                         pass
 
             except zmq.Again:
-                self._timeout_flag.set()  # 通知 ActionClient 反饋接收超時
-                break
+                # 沒有 feedback 只代表目前閒置（沒有進行中的任務），不是錯誤。
+                # 服務真的離線會由心跳把 _endpoint 設為 None，由上面的分支處理。
+                continue
             except zmq.ContextTerminated:
                 break
             except Exception as e:
@@ -470,6 +550,11 @@ class ActionFeedbackSubscriber(ClientCore):
                 if self._sub_stop_event.is_set():
                     break
                 continue
+
+        # 非主動關閉卻離開迴圈，代表 feedback 通道已無法使用，
+        # 通知 ActionClient 一併結束 result listener
+        if not self._sub_stop_event.is_set():
+            self._timeout_flag.set()
 
         # 離開迴圈後清理
         if self._socket:
@@ -495,6 +580,8 @@ class ActionClient(ClientCore):
         result_class,
         ip_address: str = "localhost",
         timeout: float = 30.0,
+        connect_timeout: float = 5.0,
+        feedback_grace: float = 0.3,
         query_port: Optional[int] = Gateway.DEFAULT_QUERY_PORT,
         heartbeat_interval: float = CLIENT_HEARTBEAT_INTERVAL,
         heartbeat_timeout: float = CLIENT_HEARTBEAT_TIMEOUT,
@@ -513,23 +600,51 @@ class ActionClient(ClientCore):
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat_timeout = heartbeat_timeout
         self._timeout = timeout
+        self._connect_timeout = connect_timeout
+        # 收到 RESULT 後，最多再等這麼久讓晚到的 feedback 補齊
+        self._feedback_grace = feedback_grace
         self._goal_class = goal_class
         self._feedback_class = feedback_class
         self._result_class = result_class
         self._result_thread = None
+        self.dealer_socket = None
+        # DEALER socket 同時被使用者線程（send_goal / cancel_goal）與
+        # result listener 線程使用，ZMQ socket 不是執行緒安全的，一律靠這把鎖序列化
+        self._dealer_lock = threading.RLock()
+        self._stop_event = threading.Event()
 
         # 追蹤處理中的任務 { goal_id: { "future": Future, "feedback_cb": Callable } }
         self.active_goals: Dict[str, Dict[str, Any]] = {}
         self.goals_lock = threading.Lock()
 
-        time.sleep(1.0)  # 等待心跳確認服務狀態
+        # 等 gateway 回報 endpoint，而不是盲目 sleep 1 秒後 connect(None)
+        if not self.wait_for_endpoint(connect_timeout):
+            print(
+                f"[{self._name}] 尚未取得 endpoint（{connect_timeout}s），將在服務上線後自動連線"
+            )
         self._init_sockets()
 
+    def _ensure_dealer(self) -> bool:
+        """必要時建立/重建 DEALER socket。呼叫端必須持有 _dealer_lock。"""
+        endpoint = self._endpoint
+        if endpoint is None:
+            return False
+
+        if self.dealer_socket is None or self._reconnect_event.is_set():
+            if self.dealer_socket is not None:
+                self.dealer_socket.close(linger=0)
+            sock = self._context.socket(zmq.DEALER)
+            sock.setsockopt(zmq.LINGER, 0)  # 防止關閉時卡住
+            sock.connect(endpoint)
+            self.dealer_socket = sock
+            self._reconnect_event.clear()
+        return True
+
     def _init_sockets(self):
-        # 1. 初始化 DEALER Socket (發送 Goal/Cancel, 接收 Result)
-        self.dealer_socket = self._context.socket(zmq.DEALER)
-        self.dealer_socket.setsockopt(zmq.LINGER, 0)  # 防止關閉時卡住
-        self.dealer_socket.connect(self._endpoint)
+        # 1. DEALER Socket (發送 Goal/Cancel, 接收 Result) 改為延遲建立，
+        #    endpoint 還沒到位時不會炸掉，服務上線後由 _ensure_dealer 補上
+        with self._dealer_lock:
+            self._ensure_dealer()
 
         # 2. 初始化 SUB Socket (接收 Feedback)
         self._feedback_timeout_flag = threading.Event()
@@ -541,12 +656,12 @@ class ActionClient(ClientCore):
             ip_address=self._ip_address,
             query_port=self._query_port,
             timeout=self._timeout,
+            connect_timeout=self._connect_timeout,
             heartbeat_interval=self._heartbeat_interval,
             heartbeat_timeout=self._heartbeat_timeout,
         )
 
         # 3. 啟動非同步監聽線程
-        self._stop_event = threading.Event()
         self._result_thread = threading.Thread(
             target=self._result_listener_loop, daemon=True
         )
@@ -565,6 +680,7 @@ class ActionClient(ClientCore):
         :return: (goal_id, Future 物件)
         """
 
+        goal = to_message(goal)
         if not isinstance(goal, self._goal_class):
             print(
                 f"[{self._name} Client] Warning: Wrong goal class, expect: {self._goal_class.__name__}"
@@ -572,25 +688,26 @@ class ActionClient(ClientCore):
             raise ValueError(f"Wrong goal class, expect: {self._goal_class.__name__}")
 
         goal_id = str(uuid.uuid4())
+        payload = ProtobufMessageHandler.serialize(goal)
         future = Future()
 
-        with self.goals_lock:
-            self.active_goals[goal_id] = {"future": future}
+        with self._dealer_lock:
+            if not self._ensure_dealer():
+                raise ConnectionError(
+                    f"[{self._name}] 尚未取得 action server 的 endpoint，無法送出 goal"
+                )
 
-        # 讓 SUB Socket 動態訂閱這個特定 goal_id 的進度，過濾掉別人的進度
-        self._feedback_subscriber.track_goal(goal_id, feedback_callback)
+            # 先登記追蹤再送出，避免 RESULT 比登記還早回來
+            with self.goals_lock:
+                self.active_goals[goal_id] = {"future": future}
+            self._feedback_subscriber.track_goal(goal_id, feedback_callback)
 
-        # 依照 Server 規範發送多幀訊息：
-        # DEALER 自動加空幀，所以發出：[b"", b"GOAL", goal_id, payload]
-        # Server 收到會是：[Routing_ID, b"", b"GOAL", goal_id, payload]
-        self.dealer_socket.send_multipart(
-            [
-                b"",
-                b"GOAL",
-                goal_id.encode("utf-8"),
-                ProtobufMessageHandler.serialize(goal),
-            ]
-        )
+            # 依照 Server 規範發送多幀訊息：
+            # DEALER 自動加空幀，所以發出：[b"", b"GOAL", goal_id, payload]
+            # Server 收到會是：[Routing_ID, b"", b"GOAL", goal_id, payload]
+            self.dealer_socket.send_multipart(
+                [b"", b"GOAL", goal_id.encode("utf-8"), payload]
+            )
 
         def _callback_wrapper(fut):
             try:
@@ -621,7 +738,37 @@ class ActionClient(ClientCore):
                 return
 
         # 發送取消訊息：[b"", b"CANCEL", goal_id]
-        self.dealer_socket.send_multipart([b"", b"CANCEL", goal_id.encode("utf-8")])
+        with self._dealer_lock:
+            if not self._ensure_dealer():
+                print(f"[{self._name} Client] Cancel failed: 尚未連線到 action server")
+                return
+            self.dealer_socket.send_multipart(
+                [b"", b"CANCEL", goal_id.encode("utf-8")]
+            )
+
+    def _await_final_feedback(self, goal_id: str, expected_seq: int):
+        """RESULT 走 DEALER、feedback 走 SUB，是兩條獨立通道，最後一筆 feedback
+        很容易比 RESULT 晚到。這裡在完成 Future 之前短暫等它補齊，確保
+        「所有進度都送到使用者手上」才觸發 result_callback。
+
+        expected_seq 為 0 代表對方是舊版 server（沒有這個欄位）或本來就沒有
+        feedback，此時直接返回不等待。
+        """
+        if expected_seq <= 0 or self._feedback_grace <= 0:
+            return
+
+        deadline = time.monotonic() + self._feedback_grace
+        while time.monotonic() < deadline:
+            if self._feedback_subscriber.received_seq(goal_id) >= expected_seq:
+                return
+            time.sleep(0.005)
+
+        missing = expected_seq - self._feedback_subscriber.received_seq(goal_id)
+        if missing > 0:
+            print(
+                f"[{self._name} Client] Goal {goal_id} 有 {missing} 筆 feedback "
+                f"在 {self._feedback_grace}s 內未送達，可能已遺失"
+            )
 
     def _result_listener_loop(self):
         """監聽 DEALER Socket 回傳的最終任務結果"""
@@ -633,12 +780,19 @@ class ActionClient(ClientCore):
                     )
                     break
 
-                if not self.dealer_socket.poll(100):
+                # poll 與 recv 都必須在鎖內，否則會與 send_goal / cancel_goal
+                # 併發操作同一個 socket；用短 timeout 避免長時間占住鎖
+                frames = None
+                with self._dealer_lock:
+                    if self._ensure_dealer() and self.dealer_socket.poll(20):
+                        frames = self.dealer_socket.recv_multipart()
+
+                if frames is None:
+                    self._stop_event.wait(0.01)  # 讓出鎖，避免餓死送出端
                     continue
 
-                # DEALER 接收會自動剝掉空幀，收到格式：[b"RESULT", goal_id, status, payload]
-                frames = self.dealer_socket.recv_multipart()
-                if len(frames) < 4:
+                # 收到格式：[b"", b"RESULT", goal_id, status, payload]
+                if len(frames) < 5:
                     continue
 
                 msg_type = frames[1].decode("utf-8")
@@ -648,22 +802,42 @@ class ActionClient(ClientCore):
                     result = ProtobufMessageHandler.deserialize(
                         self._result_class, frames[4]
                     )
+                    # 第 6 個 frame 是 server 送出的 feedback 總筆數（舊版沒有）
+                    expected_seq = 0
+                    if len(frames) >= 6:
+                        try:
+                            expected_seq = int(frames[5])
+                        except ValueError:
+                            expected_seq = 0
+
                     with self.goals_lock:
-                        if goal_id in self.active_goals:
-                            # 解除 SUB Socket 對該任務的訂閱，釋放資源
-                            self._feedback_subscriber.untrack_goal(goal_id)
+                        entry = self.active_goals.pop(goal_id, None)
 
-                            # 把結果塞入 Future，通知等待的線程
-                            result_dict = {"status": status, "data": result}
-                            self.active_goals[goal_id]["future"].set_result(result_dict)
+                    if entry is not None:
+                        self._await_final_feedback(goal_id, expected_seq)
+                        # 解除 SUB Socket 對該任務的追蹤，釋放資源
+                        self._feedback_subscriber.untrack_goal(goal_id)
+                        # set_result 會同步觸發使用者的 result_callback，
+                        # 必須在鎖外執行，否則 callback 內再送 goal 就會死鎖
+                        entry["future"].set_result({"status": status, "data": result})
 
-                            # # 移除追蹤
-                            del self.active_goals[goal_id]
-
-            except zmq.ZMQError:
+            except zmq.ContextTerminated:
                 break
+            except zmq.ZMQError as e:
+                if self._stop_event.is_set():
+                    break
+                print(f"[{self._name} Client] Result listener ZMQ error: {e}")
+                self._stop_event.wait(0.1)
+            except Exception as e:
+                # 單筆訊息處理失敗不該讓整條 listener 消失
+                print(f"[{self._name} Client] Result listener error: {e}")
+                self._stop_event.wait(0.1)
+
         self._feedback_subscriber.close()
-        self.dealer_socket.close()
+        with self._dealer_lock:
+            if self.dealer_socket is not None:
+                self.dealer_socket.close(linger=0)
+                self.dealer_socket = None
 
     def close(self):
         for goal_id in list(self.active_goals.keys()):
@@ -672,3 +846,4 @@ class ActionClient(ClientCore):
         self._stop_event.set()
         if self._result_thread:
             self._result_thread.join(timeout=2.0)
+        super().close()  # 停掉心跳線程，原本會遺留

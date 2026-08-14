@@ -5,7 +5,9 @@ from typing import Any, Literal, Optional, Protocol, Tuple
 import zmq
 
 from lemegeton.gateway import HeartbeatClient, ServiceType
-from lemegeton.serializer import ProtobufMessageHandler
+from lemegeton import blob
+from lemegeton.serializer import ProtobufMessageHandler, decode_payload
+from lemegeton.staging import to_payload
 
 
 class ServiceCore:
@@ -52,6 +54,11 @@ class ServiceCore:
             s.bind(("", 0))
             return s.getsockname()[1]
 
+    @property
+    def name_conflict(self) -> bool:
+        """名稱是否已被其他實例佔走。為 True 時本服務已停止心跳、不再能被查詢到。"""
+        return getattr(self._heartbeat_client, "name_conflict", False)
+
 
 class Responder(ServiceCore):
     def __init__(
@@ -96,42 +103,55 @@ class Responder(ServiceCore):
 
     def _response_process(self):
         while not self._stop_event.is_set():
+            # --- 收 ---
             try:
                 if not self._socket.poll(100):
                     continue
 
                 message_bytes = self._socket.recv()
-                try:
-                    message = ProtobufMessageHandler.deserialize(
-                        self._message_class, message_bytes
-                    )
-                except Exception:
-                    print(f"Wrong message type, expect:{self._message_class.__name__}")
-                    empty_response = self._message_class()
-                    self._socket.send(ProtobufMessageHandler.serialize(empty_response))
-                    continue
-
-                # Handle the request
-                response_message = self._callback(message)
-                if not isinstance(response_message, self._response_class):
-                    print(
-                        f"Warning: Wrong message class, expect: {self._response_class.__name__}"
-                    )
-                    response_message = self._response_class()
-
-                response_bytes = ProtobufMessageHandler.serialize(response_message)
-                self._socket.send(response_bytes)
-
-            except Exception as e:
-                print(f"[{self._name}] Callback execution error: {e}")
-
             except zmq.ContextTerminated:
                 # 當 context 被關閉時，優雅退出
                 print(f"[{self._name}] Context terminated.")
                 break
-            except Exception as e:
-                # 捕捉其他非預期的 ZMQ 錯誤
-                print(f"[{self._name}] Unexpected error: {e}")
+            except zmq.ZMQError as e:
+                if self._stop_event.is_set():
+                    break
+                print(f"[{self._name}] Receive error: {e}")
+                continue
+
+            # --- 處理 ---
+            # REP socket 收到請求後「一定」要送出一次回應，
+            # 否則狀態機會停在等待 send 的狀態，之後每次 recv 都會失敗。
+            try:
+                message = ProtobufMessageHandler.deserialize(
+                    self._message_class, message_bytes
+                )
+            except Exception:
+                print(
+                    f"[{self._name}] Wrong message type, expect: {self._message_class.__name__}"
+                )
+                response_message = self._response_class()
+            else:
+                try:
+                    response_message = self._callback(message)
+                except Exception as e:
+                    print(f"[{self._name}] Callback execution error: {e}")
+                    response_message = self._response_class()
+
+                if not isinstance(response_message, self._response_class):
+                    print(
+                        f"[{self._name}] Warning: Wrong message class, expect: {self._response_class.__name__}"
+                    )
+                    response_message = self._response_class()
+
+            # --- 送 ---
+            try:
+                self._socket.send(ProtobufMessageHandler.serialize(response_message))
+            except zmq.ContextTerminated:
+                print(f"[{self._name}] Context terminated.")
+                break
+            except zmq.ZMQError as e:
+                print(f"[{self._name}] Failed to send response: {e}")
                 if self._stop_event.is_set():
                     break
 
@@ -180,14 +200,25 @@ class Publisher(ServiceCore):
         if self._enable_ipc:
             self._socket.bind(f"ipc://{self._ipc_path}")
 
-    def send(self, message):
+    def send(self, message, arrays=None):
+        """送出訊息。
+
+        :param arrays: 選填。``{Blob 欄位路徑: ndarray}``。使用 ``lemegeton.build()``
+                       時直接指派給 Blob 欄位即可，不必再傳這個參數。小的陣列會內嵌
+                       進訊息，大的自動搬到訊息體外（見 :mod:`lemegeton.blob`）。
+        """
+        message, staged = to_payload(message)
+        if arrays:
+            staged = {**staged, **arrays}
         if not isinstance(message, self._message_class):
             print(
                 f"[{self._name}] Warning: Wrong message class, expect: {self._message_class.__name__}"
             )
             return
-        message_bytes = ProtobufMessageHandler.serialize(message)
-        self._socket.send(message_bytes)
+        if staged:
+            self._socket.send(blob.encode(message, staged), copy=False)
+        else:
+            self._socket.send(ProtobufMessageHandler.serialize(message))
 
     def send_multipart(self, message_parts):
         self._socket.send_multipart(message_parts)
@@ -211,6 +242,7 @@ class Subscriber(ServiceCore):
         callback,
         mode: Literal["tcp", "ipc", "both"] = "tcp",
         port: Optional[int] = None,
+        unpack_blobs: bool = False,
     ):
         try:
             super().__init__(context, name, ServiceType.SUBSCRIBER, port, mode)
@@ -220,6 +252,8 @@ class Subscriber(ServiceCore):
 
         self._message_class = message_class
         self._callback = callback
+        # True 時 callback 簽章為 (message, arrays)
+        self._unpack_blobs = unpack_blobs
 
         self._socket = context.socket(zmq.SUB)
         self._socket.setsockopt(zmq.LINGER, 0)
@@ -249,8 +283,8 @@ class Subscriber(ServiceCore):
 
                 message_bytes = self._socket.recv()
                 try:
-                    message = ProtobufMessageHandler.deserialize(
-                        self._message_class, message_bytes
+                    args = decode_payload(
+                        message_bytes, self._message_class, self._unpack_blobs
                     )
                 except Exception:
                     print(
@@ -258,7 +292,7 @@ class Subscriber(ServiceCore):
                     )
                     continue
                 try:
-                    self._callback(message)
+                    self._callback(*args)
                 except Exception as e:
                     print(f"[{self._name}] Callback execution error: {e}")
 
@@ -304,6 +338,13 @@ class ActionGoal:
         self._feedback_class = feedback_class
         self._feedback_callback = feedback_callback
         self._cancel_event = cancel_event
+        # feedback 的流水號，會隨 RESULT 一起回傳，讓 Client 知道自己收齊了沒有
+        self._feedback_seq = 0
+
+    @property
+    def feedback_seq(self) -> int:
+        """目前為止送出的 feedback 筆數"""
+        return self._feedback_seq
 
     def send_feedback(self, feedback_data: Any):
         if not isinstance(feedback_data, self._feedback_class):
@@ -311,8 +352,9 @@ class ActionGoal:
                 f"Warning: Wrong feedback class, expect: {self._feedback_class.__name__}"
             )
             return
-        # 格式：[Goal_ID, 序列化後的 Feedback]
-        self._feedback_callback(self.goal_id, feedback_data)
+        self._feedback_seq += 1
+        # 格式：[Goal_ID, 序列化後的 Feedback, 流水號]
+        self._feedback_callback(self.goal_id, feedback_data, self._feedback_seq)
 
     def is_canceled(self) -> bool:
         """檢查 Client 是否發出了取消請求"""
@@ -353,6 +395,8 @@ class ActionServer(ServiceCore):
         self._execute_callback = callback
         self._accept_thread = None
         self._close_timeout = 5.0  # 關閉時等待 Worker 結束的最大時間
+        self._closed = False  # close() 的冪等保護
+        self._feedback_closed = False  # feedback publisher 是否已關閉
 
         # 1. 初始化 ROUTER Socket
         self._goal_socket = context.socket(zmq.ROUTER)
@@ -366,6 +410,12 @@ class ActionServer(ServiceCore):
                 self._goal_socket.bind(f"tcp://*:{self._tcp_port}")
             except Exception as e:
                 raise Exception(f"[{name}] Fail to bind {self._tcp_port}: {e}")
+
+        if self._enable_ipc:
+            try:
+                self._goal_socket.bind(f"ipc://{self._ipc_path}")
+            except Exception as e:
+                raise Exception(f"[{name}] Fail to bind ipc://{self._ipc_path}: {e}")
 
         # 2. 初始化 Feedback Publisher
         self._feedback_pub_lock = threading.Lock()  # 增加 Feedback Publisher 的鎖
@@ -387,12 +437,50 @@ class ActionServer(ServiceCore):
         self._accept_thread.start()
         print(f"[{self._name}] Action Server started successfully.")
 
-    def close(self):
+    def close(self, timeout: Optional[float] = None):
+        """關閉順序：停止收單 → 等 worker 收尾 → 才關閉 feedback publisher 與 socket。
+
+        先前是在 listener 迴圈裡收尾，而 close() 又同時去關 feedback publisher，
+        導致還在跑的 worker 送 feedback 時會撞到已關閉的 socket。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        timeout = self._close_timeout if timeout is None else timeout
+
+        # 1. 停止收單
         self._stop_event.set()
         if self._accept_thread:
-            self._accept_thread.join()
+            self._accept_thread.join(timeout=timeout)
 
+        # 2. 通知所有 worker 取消並等它們收尾。
+        #    此時 feedback publisher 與 goal socket 都還活著，
+        #    worker 仍可以正常送出最後的 feedback 與 RESULT。
+        with self.tasks_lock:
+            tasks = list(self.active_tasks.items())
+        for _, task in tasks:
+            task["cancel_event"].set()
+        for goal_id, task in tasks:
+            worker = task.get("worker")
+            if worker is not None:
+                worker.join(timeout=timeout)
+                if worker.is_alive():
+                    print(
+                        f"[{self._name}] Goal {goal_id} 的 worker 未在 {timeout}s 內結束"
+                    )
+
+        # 3. worker 都收乾淨了，才關閉對外資源
+        with self._feedback_pub_lock:
+            self._feedback_closed = True
         self._feedback_pub.close()
+
+        if getattr(self, "_heartbeat_client", None):
+            self._heartbeat_client.stop()
+
+        with self._socket_lock:
+            if self._goal_socket is not None:
+                self._goal_socket.close(linger=0)
+                self._goal_socket = None
 
     def _listener_loop(self):
         """ROUTER 監聽迴圈：只負責收單與分發"""
@@ -440,20 +528,9 @@ class ActionServer(ServiceCore):
             except Exception as e:
                 print(f"[{self._name}] Unexpected error in listener: {e}")
 
-        # 發送取消信號給所有 Worker，並等待它們結束
-        task_ids = list(self.active_tasks.keys())
-        for task_id in task_ids:
-            if task_id in self.active_tasks:
-                self.active_tasks[task_id]["cancel_event"].set()
-                self.active_tasks[task_id]["worker"].join(timeout=self._close_timeout)
-
-        # 關閉處理
-        if hasattr(self, "_heartbeat_client") and self._heartbeat_client:
-            self._heartbeat_client.stop()
-
-        with self._socket_lock:
-            if self._goal_socket:
-                self._goal_socket.close(linger=0)
+        # 收尾統一交給 close() 處理：這裡若自行遍歷 active_tasks 會與
+        # worker 完成時的刪除動作競爭（KeyError / dict changed size），
+        # 且關閉順序也無法與 close() 的 feedback publisher 協調。
 
     def _handle_new_goal(self, routing_id: bytes, goal_id: str, goal_data: Any):
         """收到新任務：建立取消訊號，並交給獨立的 Worker 線程處理"""
@@ -479,14 +556,21 @@ class ActionServer(ServiceCore):
             if goal_id in self.active_tasks:
                 self.active_tasks[goal_id]["cancel_event"].set()
 
-    def _pub_feedback(self, goal_id: str, feedback_data: Any):
+    def _pub_feedback(self, goal_id: str, feedback_data: Any, seq: int):
         with self._feedback_pub_lock:
-            self._feedback_pub.send_multipart(
-                [
-                    goal_id.encode("utf-8"),
-                    ProtobufMessageHandler.serialize(feedback_data),
-                ]
-            )
+            if self._feedback_closed:
+                print(f"[{self._name}] Feedback publisher 已關閉，丟棄 {goal_id} 的進度")
+                return
+            try:
+                self._feedback_pub.send_multipart(
+                    [
+                        goal_id.encode("utf-8"),
+                        ProtobufMessageHandler.serialize(feedback_data),
+                        str(seq).encode("utf-8"),
+                    ]
+                )
+            except zmq.ZMQError as e:
+                print(f"[{self._name}] Failed to publish feedback: {e}")
 
     def _worker_launcher(
         self,
@@ -521,18 +605,25 @@ class ActionServer(ServiceCore):
 
         # 透過 ROUTER 回傳結果
         # 💡 關鍵修正：發送時必須進 Lock，防止與 listener_loop 衝突
+        # 最後一個 frame 是 feedback 的總筆數，讓 Client 判斷自己收齊了沒有
         try:
             with self._socket_lock:
-                self._goal_socket.send_multipart(
-                    [
-                        routing_id,
-                        b"",
-                        b"RESULT",
-                        goal_id.encode("utf-8"),
-                        status_str.encode("utf-8"),
-                        ProtobufMessageHandler.serialize(result_data),
-                    ]
-                )
+                if self._goal_socket is None:
+                    print(
+                        f"[{self._name}] Server 已關閉，goal {goal_id} 的結果無法送出"
+                    )
+                else:
+                    self._goal_socket.send_multipart(
+                        [
+                            routing_id,
+                            b"",
+                            b"RESULT",
+                            goal_id.encode("utf-8"),
+                            status_str.encode("utf-8"),
+                            ProtobufMessageHandler.serialize(result_data),
+                            str(goal_handle.feedback_seq).encode("utf-8"),
+                        ]
+                    )
         except zmq.ZMQError as e:
             print(f"[{self._name}] Failed to send result to client: {e}")
 

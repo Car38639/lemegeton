@@ -1,11 +1,11 @@
-import json
+import errno
+import socket
 import threading
 import time
 import uuid
 from enum import Enum
 from typing import Optional
 
-import redis
 import zmq
 
 
@@ -47,12 +47,15 @@ class Gateway:
     HEARTBEAT_PATH = "@lemegeton_heartbeat"
     HEARTBEAT_RATE = 10  # 每 10 秒發送一次心跳
     DEFAULT_QUERY_PORT = 60001
+    # 註冊多久之後才允許對舊擁有者做存活探測。
+    # 服務是「先註冊、後 bind」，剛註冊完的那一瞬間端點還沒綁上，
+    # 這段緩衝可避免把正在啟動的服務誤判為已死。
+    PROBE_GRACE = 3.0
 
-    def __init__(
-        self, port: Optional[int] = None, redis_conf={"host": "localhost", "port": 6379}
-    ):
-        self.r = redis.Redis(**redis_conf, decode_responses=True)
-        self.local_cache = {}  # 格式: {name: {"data": dict, "last_seen": float}}
+    def __init__(self, port: Optional[int] = None):
+        # 註冊表就是這個 dict，沒有外部儲存。
+        # 格式: {name: {"data": dict, "service_id": str, "last_seen": float}}
+        self.local_cache = {}
         self.context = zmq.Context()
         self.ttl = 2 * Gateway.HEARTBEAT_RATE  # 設定2倍心跳的秒數為過期門檻
 
@@ -74,34 +77,92 @@ class Gateway:
         self.poller.register(self.heartbeat_sock, zmq.POLLIN)
         self.poller.register(self.query_sock, zmq.POLLIN)
 
-        self.last_sync_time = time.time()
+        self.last_cleanup_time = time.time()
 
-    def sync_and_cleanup(self):
-        """同步數據至 Redis 並清理本地過期快取"""
+    @staticmethod
+    def _address_in_use(family, address, reuse_addr=False) -> Optional[bool]:
+        """試綁一個位址。True = 已被佔用，False = 沒人在聽，None = 無法判斷。
+
+        這裡刻意用標準 socket 而不是 ZMQ socket：ZMQ 的 close() 是非同步的，
+        探測用的 socket 會短暫留住該 port，剛好撞上服務重啟時配到同一個 port
+        就會害它 bind 失敗。標準 socket 的 close() 是同步的，不留殘影。
+        """
+        probe = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            if reuse_addr:
+                # 允許跨過 TIME_WAIT，但若真的有 listener 仍會是 EADDRINUSE
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(address)
+            return False
+        except OSError as e:
+            return True if e.errno == errno.EADDRINUSE else None
+        finally:
+            probe.close()
+
+    def _owner_is_alive(self, info) -> bool:
+        """探測舊註冊的擁有者是否還活著。
+
+        作法是試著去綁它註冊的位址：綁得起來就代表沒有任何行程在監聽，
+        該服務已經崩潰；綁不起來（EADDRINUSE）代表還有人佔著，仍然活著。
+        這樣崩潰的服務不必等滿 TTL 才能被同名重啟接管。
+        """
+        endpoint = (info.get("data") or {}).get("endpoint") or {}
+        results = []
+
+        ipc_path = endpoint.get("ipc")
+        if ipc_path:
+            if ipc_path.startswith("@"):
+                # ZMQ 的 ipc://@name 對應 Linux abstract socket，位址是 "\0name"
+                results.append(
+                    self._address_in_use(socket.AF_UNIX, "\0" + ipc_path[1:])
+                )
+            else:
+                results.append(None)  # 檔案系統路徑的 ipc，無法用試綁判斷
+
+        tcp_port = endpoint.get("tcp")
+        if tcp_port:
+            results.append(
+                self._address_in_use(
+                    socket.AF_INET, ("", int(tcp_port)), reuse_addr=True
+                )
+            )
+
+        if any(r is True for r in results):
+            return True  # 任一端點還被佔著 → 還活著
+        if any(r is False for r in results):
+            return False  # 有明確結論且都沒人在聽 → 已死
+        return True  # 沒有端點資訊或無法判斷，保守視為還活著
+
+    def _can_take_over(self, name, current_service, request_service_id):
+        """判斷同名的舊註冊是否已失效，可讓新的 service_id 接管"""
+        age = time.time() - current_service.get("last_seen", 0)
+        if age > self.ttl:
+            reason = "心跳已超過 TTL"
+        elif age > Gateway.PROBE_GRACE and not self._owner_is_alive(current_service):
+            reason = "註冊的端點已無人監聽"
+        else:
+            return False
+
+        print(
+            f"[Registry] 服務 {name} 的舊註冊已失效（{reason}），"
+            f"允許 {request_service_id} 接管"
+        )
+        return True
+
+    def cleanup_stale(self):
+        """清理心跳已過期的服務"""
         now = time.time()
-        stale_keys = []
+        stale_keys = [
+            name
+            for name, info in self.local_cache.items()
+            if now - info.get("last_seen", 0) > self.ttl
+        ]
 
-        # 找出已過期的 Key
-        for name, info in self.local_cache.items():
-            if now - info["last_seen"] > self.ttl:
-                stale_keys.append(name)
-
-        # 執行清理
         for name in stale_keys:
             del self.local_cache[name]
-            # 同步刪除 Redis 中的資料
-            self.r.delete(f"svc:{name}")
             print(f"[Cleanup] 服務 {name} 已過期，執行清理")
 
-        # 同步剩餘的活躍數據至 Redis
-        if self.local_cache:
-            pipe = self.r.pipeline()
-            for name, info in self.local_cache.items():
-                pipe.set(f"svc:{name}", json.dumps(info), ex=self.ttl)
-            pipe.execute()
-            print(f"[Sync] 同步 {len(self.local_cache)} 個活躍服務至 Redis")
-
-        self.last_sync_time = now
+        self.last_cleanup_time = now
 
     def run(self):
         print("Gateway 啟動成功，進入監聽狀態...")
@@ -119,6 +180,17 @@ class Gateway:
 
                     if action == RegistryAction.REGISTER.value:
                         current_service = self.local_cache.get(name)
+                        # 只有「還活著」的舊條目才擋新註冊：崩潰的服務不會註銷,
+                        # 心跳斷了超過 TTL 就視同過期,或是註冊的端點已經沒人監聽
+                        # （代表行程已死），兩者都直接讓新身份接管。
+                        if (
+                            current_service
+                            and current_service.get("service_id") != request_service_id
+                            and self._can_take_over(
+                                name, current_service, request_service_id
+                            )
+                        ):
+                            current_service = None
                         if (
                             current_service
                             and current_service.get("service_id") != request_service_id
@@ -147,7 +219,6 @@ class Gateway:
                             and current_service.get("service_id") == request_service_id
                         ):
                             del self.local_cache[name]
-                            self.r.delete(f"svc:{name}")
                             print(f"[Unregister] 服務 {name} 已被註銷")
                             self.registry_sock.send_json(
                                 {"status": GatewayStatus.SUCCESS.value}
@@ -173,37 +244,19 @@ class Gateway:
                     current_service = self.local_cache.get(name)
 
                     if not current_service:
-                        # 本地無此服務，從 Redis 查詢資料
-                        val = self.r.get(f"svc:{name}")
-                        if val:
-                            info = json.loads(val)
-                            if info.get("service_id") != new_service_id:
-                                print(
-                                    f"[Warning] 服務名稱 '{name}' ID 不符合。從 Redis 查詢到的 ID 與心跳請求的 ID 不匹配。"
-                                )
-                                self.heartbeat_sock.send_json(
-                                    {"status": GatewayStatus.MISMATCH.value}
-                                )
-                            else:
-                                self.local_cache[name] = info
-                                print(
-                                    f"[Heartbeat] 服務 '{name}' 從 Redis 回填至本地快取，ID: {new_service_id}"
-                                )
-                                self.heartbeat_sock.send_json(
-                                    {"status": GatewayStatus.SUCCESS.value}
-                                )
-                        else:
-                            print(
-                                f"[Heartbeat] 服務 '{name}' 不存在於本地快取和 Redis 中，將其註冊到本地快取，ID: {new_service_id}"
-                            )
-                            self.local_cache[name] = {
-                                "data": msg.get("data"),
-                                "service_id": new_service_id,
-                                "last_seen": time.time(),
-                            }
-                            self.heartbeat_sock.send_json(
-                                {"status": GatewayStatus.SUCCESS.value}
-                            )
+                        # 註冊表不認得這個名稱（例如 gateway 剛重啟過），
+                        # 直接把這次心跳當成重新註冊，讓服務自行癒合。
+                        print(
+                            f"[Heartbeat] 服務 '{name}' 不在註冊表中，以本次心跳重新註冊，ID: {new_service_id}"
+                        )
+                        self.local_cache[name] = {
+                            "data": msg.get("data"),
+                            "service_id": new_service_id,
+                            "last_seen": time.time(),
+                        }
+                        self.heartbeat_sock.send_json(
+                            {"status": GatewayStatus.SUCCESS.value}
+                        )
 
                     elif current_service.get("service_id") != new_service_id:
                         print(f"[Warning] 服務名稱 '{name}' ID 不符合。")
@@ -224,7 +277,7 @@ class Gateway:
                     name = msg.get("name")
 
                     res_info = self.local_cache.get(name)
-                    if res_info:
+                    if res_info and res_info.get("data"):
                         self.query_sock.send_json(
                             {
                                 "status": GatewayStatus.FOUND.value,
@@ -232,26 +285,13 @@ class Gateway:
                             }
                         )
                     else:
-                        # 本地無則查 Redis
-                        val = self.r.get(f"svc:{name}")
-                        if val:
-                            data = json.loads(val)
-                            # 回填本地快取
-                            self.local_cache[name] = {
-                                "data": data,
-                                "last_seen": time.time(),
-                            }
-                            self.query_sock.send_json(
-                                {"status": GatewayStatus.FOUND.value, "data": data}
-                            )
-                        else:
-                            self.query_sock.send_json(
-                                {"status": GatewayStatus.NOT_FOUND.value}
-                            )
+                        self.query_sock.send_json(
+                            {"status": GatewayStatus.NOT_FOUND.value}
+                        )
 
-                # 每 5 秒執行一次同步與清理
-                if time.time() - self.last_sync_time > 5:
-                    self.sync_and_cleanup()
+                # 每 5 秒清理一次心跳過期的服務
+                if time.time() - self.last_cleanup_time > 5:
+                    self.cleanup_stale()
 
         except KeyboardInterrupt:
             print("\nServer is shutting down...")
@@ -277,11 +317,20 @@ class HeartbeatClient:
         self.name = name
         self.data = data
         self.service_id = str(uuid.uuid4())  # 生成本次啟動的唯一身份標籤
-        res = self._register_service()
-        if not res:
+        # 心跳期間發現名稱被別的 service_id 佔走時會設為 True，供服務端查詢
+        self.name_conflict = False
+        # 首次註冊失敗多半是暫時的:服務快速重啟時,gateway 裡上一世的註冊
+        # 要到 TTL(2倍心跳)後才過期;或 gateway 本身還沒起來。這兩種都會
+        # 自行解除,所以重試到略超過 TTL 再放棄,而不是一次失敗就讓整個
+        # 服務 crash 進 restart loop。
+        deadline = time.time() + 2 * Gateway.HEARTBEAT_RATE + 5
+        while not self._register_service():
             self.registry_sock.close()
             self.heartbeat_sock.close()
-            raise Exception(f"[{self.name}] Service registration failed")
+            if time.time() >= deadline:
+                raise Exception(f"[{self.name}] Service registration failed")
+            print(f"[{self.name}] Registration not accepted yet; retrying...")
+            time.sleep(2.0)
 
         self._heartbeat_event = threading.Event()
         self._heartbeat_thread = threading.Thread(
@@ -350,13 +399,19 @@ class HeartbeatClient:
                 )
                 resp = self.heartbeat_sock.recv_json()
 
-                if resp.get("status") == GatewayStatus.ALREADY_EXISTS.value:
-                    # print(
-                    #     f"[{self.name}]  ID mismatch detected. Another service with the same name is active."
-                    # )
-
+                # Gateway 在心跳路徑回 MISMATCH、在註冊路徑回 ALREADY_EXISTS，
+                # 兩者都代表「這個名稱現在不屬於我」。原本只檢查 ALREADY_EXISTS，
+                # 因此心跳路徑的衝突永遠偵測不到，兩個同名服務會互相覆寫註冊資訊。
+                if resp.get("status") in (
+                    GatewayStatus.MISMATCH.value,
+                    GatewayStatus.ALREADY_EXISTS.value,
+                ):
+                    print(
+                        f"[{self.name}] 服務名稱已被其他實例佔用（service_id 不符），"
+                        f"停止心跳以免覆寫對方的註冊。本服務將無法再被查詢到。"
+                    )
+                    self.name_conflict = True
                     self._heartbeat_event.set()  # 停止心跳，避免干擾他人
-                    self.heartbeat_sock.close()
                     break
             except zmq.Again:
                 # print(f"[{self.name}] Heartbeat timeout. No response from Gateway.")
@@ -378,6 +433,11 @@ class HeartbeatClient:
                 time.sleep(0.1)  # 避免忙等
 
     def stop(self):
+        # 冪等：重複呼叫時第二次的 send_json 會撞到已關閉的 socket
+        if getattr(self, "_stopped", False):
+            return
+        self._stopped = True
+
         self._heartbeat_event.set()
         if self._heartbeat_thread.is_alive():
             self._heartbeat_thread.join()
