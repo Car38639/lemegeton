@@ -1,17 +1,17 @@
-"""大型數值資料（影像、pose 陣列）的傳送與讀取範例。
+"""大型數值資料（影像）的傳送與讀取範例。
 
 延續 `lemegeton.build()` 的寫法 —— **ndarray 直接指派給 Blob 欄位就好**，
 框架會依大小自動決定要內嵌進訊息還是搬到訊息體外::
 
-    frame = lemegeton.build(CameraFrame)
-    frame.image = rgb                # ndarray，shape/dtype 自動填
+    frame = lemegeton.build(Image)
+    frame.data = rgb                 # ndarray，shape/dtype 自動填
     publisher.send(frame)
 
 收端加上 ``unpack_blobs=True``，callback 就會拿到 ``(message, arrays)``，
 不論發端選了哪種模式都一樣::
 
     def on_frame(msg, arrays):
-        rgb = arrays["image"]        # ndarray
+        rgb = arrays["data"]         # ndarray
 
 執行方式::
 
@@ -25,9 +25,7 @@ import numpy as np
 
 import lemegeton
 from lemegeton import blob
-from lemegeton.msg.sensor.frame_pb2 import CameraFrame, PoseArray
-
-JOINTS = ("pelvis", "waist", "torso", "left_wrist", "right_wrist")
+from lemegeton.msg.sensor.image_pb2 import Image
 
 
 def section(title):
@@ -43,32 +41,25 @@ def publish_frame(publisher, capture) -> bool:
     if not ok:
         return False
 
-    frame = lemegeton.build(CameraFrame)
+    frame = lemegeton.build(Image)
     frame.camera_id = "head_rgb"
     frame.encoding = "bgr8"
-    frame.image = image                 # ← ndarray 直接指派，shape/dtype 自動填
+    frame.shape = list(image.shape)     # 原始尺寸；壓縮送出時這是唯一的來源
+    frame.data = image                  # ← ndarray 直接指派，shape/dtype 自動填
     publisher.send(frame)
     return True
-
-
-def publish_poses(publisher, poses: np.ndarray) -> None:
-    """送一組 pose 陣列。欄位在子訊息底下，巢狀一樣直接指派。"""
-    msg = lemegeton.build(PoseArray)
-    msg.joints = list(JOINTS)           # 列的意義
-    msg.data = poses                    # (N, 7) float64
-    publisher.send(msg)
 
 
 # --------------------------------------------------------------------------
 # 讀取端
 # --------------------------------------------------------------------------
-def on_frame(msg: CameraFrame, arrays: dict):
+def on_frame(msg: Image, arrays: dict):
     """unpack_blobs=True 時 callback 的簽章是 (message, arrays)。
 
     ⚠️ 資料搬出訊息體時，arrays 裡是接收緩衝的 view（零複製），
        只在這個 callback 內有效。要保留請自行 .copy()。
     """
-    image = arrays.get("image")
+    image = arrays.get("data")
     if image is None:
         print("   （這一幀沒有影像）")
         return
@@ -76,20 +67,6 @@ def on_frame(msg: CameraFrame, arrays: dict):
     print(f"   camera={msg.camera_id!r} encoding={msg.encoding!r} "
           f"shape={image.shape} dtype={image.dtype} "
           f"左上角像素={tuple(int(v) for v in image[0, 0])}")
-
-    # depth 是可選欄位，沒設就不會出現在 arrays 裡
-    if "depth" in arrays:
-        print(f"   depth shape={arrays['depth'].shape}")
-
-
-def on_poses(msg: PoseArray, arrays: dict):
-    data = arrays["data"]
-    if len(msg.joints) != data.shape[0]:      # schema 一致性檢查
-        print(f"   ⚠️ joints 有 {len(msg.joints)} 個但陣列是 {data.shape[0]} 列")
-        return
-    index = {name: row for row, name in enumerate(msg.joints)}
-    wrist = data[index["left_wrist"]]
-    print(f"   {data.shape} float64   left_wrist 位置={np.round(wrist[:3], 3)}")
 
 
 # --------------------------------------------------------------------------
@@ -102,21 +79,21 @@ def two_modes():
 
     for label, image in (("縮圖 100x100", np.zeros((100, 100, 3), np.uint8)),
                          ("1080p", np.zeros((1080, 1920, 3), np.uint8))):
-        frame = lemegeton.build(CameraFrame, camera_id="cam", encoding="bgr8")
-        frame.image = image
+        frame = lemegeton.build(Image, camera_id="cam", encoding="bgr8")
+        frame.data = image
         message, arrays = frame.build_payload()
         payload = blob.encode(message, arrays)
 
         mode = "搬出訊息體" if blob.is_blob_payload(payload) else "內嵌"
         # 兩種模式收端的寫法完全一樣
-        got_msg, got_arrays = blob.decode(bytes(payload), CameraFrame)
-        ok = np.array_equal(got_arrays["image"], image)
-        inline_bytes = len(got_msg.image.data)
+        got_msg, got_arrays = blob.decode(bytes(payload), Image)
+        ok = np.array_equal(got_arrays["data"], image)
+        inline_bytes = len(got_msg.data.data)
         print(f"   {label:<12}{image.nbytes/1024:>8.0f} KB → {mode:<10}"
               f"封包 {len(payload)/1024:>8.0f} KB   "
               f"訊息內的 data {inline_bytes/1024:>6.0f} KB   還原正確={ok}")
 
-    print("\n   → 收端一律 arrays[\"image\"]，不必分辨發端用了哪種模式")
+    print("\n   → 收端一律 arrays[\"data\"]，不必分辨發端用了哪種模式")
 
 
 def why_it_matters():
@@ -157,9 +134,9 @@ def end_to_end():
 
     context = lemegeton.Context()
     image_pub = lemegeton.server.Publisher(
-        context=context, name="camera_demo", message_class=CameraFrame, mode="both")
+        context=context, name="camera_demo", message_class=Image, mode="both")
     image_sub = lemegeton.client.Subscriber(
-        context=context, name="camera_demo", message_class=CameraFrame,
+        context=context, name="camera_demo", message_class=Image,
         callback=on_frame, ip_address="localhost",
         unpack_blobs=True,               # ← callback 才會收到 (message, arrays)
         connect_timeout=5.0)
@@ -174,23 +151,7 @@ def end_to_end():
         publish_frame(image_pub, capture)
         time.sleep(0.2)
     time.sleep(0.3)
-    image_sub.close(); image_pub.close()
-
-    pose_pub = lemegeton.server.Publisher(
-        context=context, name="pose_demo", message_class=PoseArray, mode="both")
-    pose_sub = lemegeton.client.Subscriber(
-        context=context, name="pose_demo", message_class=PoseArray,
-        callback=on_poses, ip_address="localhost",
-        unpack_blobs=True, connect_timeout=5.0)
-    if pose_sub.is_connect():
-        poses = np.zeros((len(JOINTS), 7))
-        poses[:, 6] = 1.0                                  # qw = 1
-        poses[JOINTS.index("left_wrist"), :3] = (0.31, 0.42, 0.53)
-        for _ in range(3):
-            publish_poses(pose_pub, poses)
-            time.sleep(0.2)
-        time.sleep(0.3)
-    pose_sub.close(); pose_pub.close(); context.term()
+    image_sub.close(); image_pub.close(); context.term()
 
 
 if __name__ == "__main__":

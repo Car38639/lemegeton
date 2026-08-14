@@ -1,11 +1,128 @@
 syntax = "proto3";
 import "google/protobuf/timestamp.proto";
+import "lemegeton/msg/common/blob.proto";
 
 package lemegeton.msg.sensor.image;
 
+// 一則訊息只帶一個模態的一幀。想要 color + depth 的消費者訂閱兩個 channel，
+// 只想要 color 的就不必為 depth 付出頻寬（實測差 2x ~ 19x，取決於是否壓縮）。
+//
+// 四個訊息共用同一套欄位骨架，差別在各自的物理語意：
+//
+//   timestamp  擷取時刻（UTC）。
+//   camera_id  來源，例如 "ego_color" / "ego_depth"。
+//   encoding   見下方「encoding 的值域」。
+//   shape      **原始影像**尺寸 [H, W] 或 [H, W, C]，壓縮時也照填。
+//   data       像素資料。未壓縮時 Blob.shape/dtype 等同上面的 shape 與該模態的
+//              原生 dtype；壓縮時 Blob 描述的是那串位元組（1-D uint8），
+//              原始 dtype 只能從 encoding 讀出來——所以 encoding 必須帶上它。
+//
+// encoding 的值域
+// ---------------
+// 未壓縮走 OpenCV/ROS 的型別記法，本身就含 dtype 與通道數：
+//     "8UC1" "8UC3" "16UC1" "32FC1"
+// 為了相容，色彩仍接受 "bgr8" / "rgb8" / "mono8" / "mono16"。
+// 壓縮時用 "<容器>;<型別>"，把內層 dtype 一起帶出來：
+//     "jpeg;bgr8"  "png;8UC1"  "png;16UC1"
+// 只寫 "png" 是不夠的——收端會不知道解出來是 8 還是 16 位元。
+//
+// 注意：PNG 只支援 8/16 位元整數。float 的資料（例如 32FC1 的熱像或深度）
+// **不要壓縮**，OpenCV 會靜默降成 CV_8U 且訊息本身看不出資料已毀損。
+
+// 可見光影像。
 message Image {
-  bytes data = 1;
-  repeated int32 shape = 2;        
-  string dtype = 3;  
-  google.protobuf.Timestamp timestamp = 4;
+  google.protobuf.Timestamp timestamp = 1;
+  string camera_id = 2;
+  string encoding = 3;                          // "bgr8" / "jpeg;8UC3" ...
+  repeated int32 shape = 4;
+  lemegeton.msg.common.blob.Blob data = 5;
+}
+
+// 深度圖。
+//
+// raw 值本身沒有意義，一定要乘上 scale 才是公尺：
+//
+//     depth_m = raw * scale            (raw != invalid_value)
+//
+// RealSense 的 scale 來自 `first_depth_sensor().get_depth_scale()`，
+// 每台裝置、每種設定都可能不同，不要在收端硬編 0.001。
+message Depth {
+  google.protobuf.Timestamp timestamp = 1;
+  string camera_id = 2;
+  string encoding = 3;                          // "16UC1" / "32FC1" / "png;16UC1"
+  repeated int32 shape = 4;
+  lemegeton.msg.common.blob.Blob data = 5;
+
+  // 公尺 / raw 單位。未設（0）表示 data 已經是公尺。
+  float scale = 6;
+  // 代表「這個像素量不到」的 raw 值，慣例為 0。這種像素不可乘 scale 使用。
+  uint32 invalid_value = 7;
+  // 感測器的有效量測範圍（公尺）。超出範圍的值即使不等於 invalid_value
+  // 也不可信。0 表示未知。
+  float min_range = 8;
+  float max_range = 9;
+  // 要把深度轉成點雲就必須有。每台裝置固定不變，允許不設——收端改從
+  // 服務的 device info 取得。
+  Intrinsics intrinsics = 10;
+}
+
+// 紅外線影像（結構光 / 立體視覺用的原始 IR，不是熱像）。
+//
+// 與 Image 的差別在於它成對出現且受投射器影響：立體深度演算法需要知道
+// 拿到的是左還是右，以及當下投射器有沒有打點——投射器開著時 IR 影像上會
+// 有點陣，直接拿去做特徵比對會失敗。
+message Infrared {
+  google.protobuf.Timestamp timestamp = 1;
+  string camera_id = 2;
+  string encoding = 3;                          // "8UC1" / "16UC1" / "png;8UC1"
+  repeated int32 shape = 4;
+  lemegeton.msg.common.blob.Blob data = 5;
+
+  // 1 = 左，2 = 右，0 = 單一 IR 串流（對應 librealsense 的 stream index）。
+  uint32 stream_index = 6;
+  // 擷取當下紅外投射器是否開啟。
+  bool emitter_on = 7;
+}
+
+// 熱像（輻射測溫）。
+//
+// 與 Infrared 是完全不同的東西：Infrared 是照明反射回來的亮度，Thermal 是
+// 物體自身輻射換算出的溫度。raw 值換算成溫度：
+//
+//     temperature = raw * scale + offset      (單位見 unit)
+//
+// 沒有 scale/offset 的熱像只是一張灰階圖，不是溫度資料。
+message Thermal {
+  google.protobuf.Timestamp timestamp = 1;
+  string camera_id = 2;
+  string encoding = 3;                          // "16UC1" / "32FC1"（float 勿壓縮）
+  repeated int32 shape = 4;
+  lemegeton.msg.common.blob.Blob data = 5;
+
+  // 換算係數。scale 未設（0）表示 data 已經是溫度值。
+  float scale = 6;
+  float offset = 7;
+  TemperatureUnit unit = 8;
+
+  // 輻射校正參數。量測目標的發射率（0~1），以及環境反射溫度（單位同 unit）。
+  // 兩者都會影響換算結果的準確度，未設表示相機已在內部套用或不支援。
+  float emissivity = 9;
+  float reflected_temperature = 10;
+}
+
+enum TemperatureUnit {
+  TEMPERATURE_UNIT_UNSPECIFIED = 0;
+  CELSIUS = 1;
+  KELVIN = 2;
+}
+
+// 針孔相機內參。單位為像素。
+message Intrinsics {
+  float fx = 1;
+  float fy = 2;
+  float cx = 3;
+  float cy = 4;
+  // 畸變係數，順序依 model 而定（例如 OpenCV 的 plumb_bob 為 k1,k2,p1,p2,k3）。
+  string distortion_model = 5;
+  repeated float distortion_coeffs = 6;
 }
